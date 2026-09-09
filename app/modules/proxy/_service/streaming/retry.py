@@ -79,6 +79,7 @@ from app.modules.proxy.affinity import (
 )
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
 from app.modules.proxy.continuity import resolve_required_account_id
+from app.modules.proxy.continuity_diagnostics import record_continuity_decision
 from app.modules.proxy.helpers import (
     _apply_error_metadata,
     _is_account_model_unsupported_error,
@@ -89,7 +90,11 @@ from app.modules.proxy.helpers import (
     is_upstream_model_capacity_error,
 )
 from app.modules.proxy.load_balancer import AccountLease, AccountSelection
-from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
+from app.modules.proxy.replay_safety import (
+    project_unanchored_account_neutral_input,
+    project_unanchored_plaintext_history,
+    responses_payload_is_account_neutral_fresh_replay,
+)
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
 
 _REQUEST_TRANSPORT_HTTP = "http"
@@ -170,6 +175,11 @@ def _verified_cross_transport_fresh_replay(
     if not responses_payload_is_account_neutral_fresh_replay(fresh_payload.to_replay_safety_payload()):
         return None
     return fresh_payload
+
+
+def _project_unanchored_account_neutral_replay(payload: ResponsesRequest) -> ResponsesRequest | None:
+    input_items = project_unanchored_account_neutral_input(payload.to_replay_safety_payload())
+    return payload.model_copy(update={"input": input_items}) if input_items is not None else None
 
 
 def _effective_http_downstream_transport_policy(
@@ -797,6 +807,38 @@ class _StreamingRetryMixin:
             )
             return True
 
+        def _move_previsible_quota_rejection_from_soft_owner(*, account_id: str, outcome: str) -> bool:
+            """Make a rejected full resend portable without crossing hard ownership."""
+
+            nonlocal affinity, payload, payload_replay_required_account_id
+            if (
+                payload_replay_required_account_id != account_id
+                or require_preferred_account
+                or file_preferred_account_id is not None
+                or turn_state_owner_account_id is not None
+                or routing_strategy == "single_account"
+            ):
+                return False
+            normalized_input = project_unanchored_plaintext_history(payload.to_replay_safety_payload())
+            projected = (
+                payload.model_copy(update={"input": normalized_input})
+                if normalized_input is not None
+                else _project_unanchored_account_neutral_replay(payload)
+            )
+            if projected is None:
+                return False
+            payload = projected
+            payload_replay_required_account_id = None
+            affinity = replace(affinity, reallocate_sticky=True)
+            record_continuity_decision(stage="quota_handoff", reason="plaintext_replay_eligible")
+            logger.info(
+                "previsible_quota_account_neutral_replay request_id=%s outcome=%s account_id=%s",
+                request_id,
+                outcome,
+                account_id,
+            )
+            return True
+
         async def _stream_post_refresh_with_capacity_recovery(
             account: Account,
             *,
@@ -1397,7 +1439,7 @@ class _StreamingRetryMixin:
                         deferred_capacity_lease = None
                     if (
                         not account
-                        and selection.error_code == "hard_affinity_saturated"
+                        and selection.error_code in {"hard_affinity_saturated", "hard_affinity_owner_excluded"}
                         and transient_failed_account_id is not None
                         and transient_failed_account_id in excluded_account_ids
                         and not hard_affinity_same_owner_retry_attempted
@@ -2458,10 +2500,18 @@ class _StreamingRetryMixin:
                                     await _release_tracked_stream_lease(current_account_lease)
                                     current_account_lease = None
                                     excluded_account_ids.add(account.id)
-                                    _move_verified_fresh_replay_from_owner(
+                                    verified_owner_replay_moved = _move_verified_fresh_replay_from_owner(
                                         account_id=account.id,
                                         outcome="owner_previsible_failure",
                                     )
+                                    if not verified_owner_replay_moved and classified["failure_class"] in (
+                                        "rate_limit",
+                                        "quota",
+                                    ):
+                                        _move_previsible_quota_rejection_from_soft_owner(
+                                            account_id=account.id,
+                                            outcome="owner_previsible_quota_rejection",
+                                        )
                                     break
                                 await proxy._handle_stream_error(
                                     account,
@@ -2607,10 +2657,20 @@ class _StreamingRetryMixin:
                         await _release_tracked_stream_lease(current_account_lease)
                         current_account_lease = None
                         excluded_account_ids.add(account.id)
-                    _move_verified_fresh_replay_from_owner(
+                    verified_owner_replay_moved = _move_verified_fresh_replay_from_owner(
                         account_id=account.id,
                         outcome="owner_previsible_retryable_failure",
                     )
+                    if not verified_owner_replay_moved and classify_upstream_failure(
+                        error_code=exc.code,
+                        error=exc.error,
+                        http_status=None,
+                        phase="first_event",
+                    )["failure_class"] in ("rate_limit", "quota"):
+                        _move_previsible_quota_rejection_from_soft_owner(
+                            account_id=account.id,
+                            outcome="owner_previsible_retryable_quota_rejection",
+                        )
                     continue
                 except _TerminalStreamError:
                     if settlement.settlement_order_required:
@@ -3104,10 +3164,18 @@ class _StreamingRetryMixin:
                                 last_transient_exc = retry_exc
                                 await _release_tracked_stream_lease(current_account_lease)
                                 current_account_lease = None
-                                _move_verified_fresh_replay_from_owner(
+                                verified_owner_replay_moved = _move_verified_fresh_replay_from_owner(
                                     account_id=account.id,
                                     outcome="owner_post_refresh_failure",
                                 )
+                                if not verified_owner_replay_moved and classified["failure_class"] in (
+                                    "rate_limit",
+                                    "quota",
+                                ):
+                                    _move_previsible_quota_rejection_from_soft_owner(
+                                        account_id=account.id,
+                                        outcome="owner_post_refresh_quota_rejection",
+                                    )
                                 excluded_account_ids.add(account.id)
                                 continue
                             health_write_allowed = await _drain_pending_post_refresh_penalty_on_terminal(settlement)

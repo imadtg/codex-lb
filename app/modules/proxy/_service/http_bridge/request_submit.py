@@ -217,6 +217,7 @@ from app.modules.proxy.affinity import (
 )
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
 from app.modules.proxy.continuity import is_http_bridge_account_neutral_replay
+from app.modules.proxy.continuity_diagnostics import record_retry_ownership
 from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeAliasRegistration,
     DurableBridgeAliasRegistrationReceipt,
@@ -4162,6 +4163,19 @@ class _HTTPBridgeRequestSubmitMixin:
             pending_count=1,
             cache_key_family=session.key.affinity_kind,
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
+        )
+        record_retry_ownership(
+            request_id=request_state.request_id,
+            archive_request_id=request_state.archive_request_id,
+            account_id=session.account.id,
+            hard_owner=hard_owner_bound,
+            fresh_switch_allowed=fresh_hard_request_account_switch_allowed,
+            require_preferred=require_preferred_reconnect,
+            account_bound_body=account_bound_replay,
+            operation_present=request_state.operation_id is not None,
+            hard_anchor=request_state.hard_continuity_anchor,
+            owner_excluded=session.account.id in request_state.excluded_account_ids,
+            response_events=request_state.response_event_count,
         )
         reconnect_reader_kwargs = {"restart_reader": True} if restart_reader else {}
         try:

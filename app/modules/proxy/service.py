@@ -88,6 +88,7 @@ from app.core.openai.models import CompactResponsePayload, OpenAIResponsePayload
 from app.core.openai.requests import (
     ResponsesCompactRequest,
     ResponsesRequest,
+    strip_replayed_tool_call_namespaces_from_payload,
 )
 from app.core.resilience.network_recovery import (
     ProcessNetworkRecovery as ProcessNetworkRecovery,
@@ -2475,7 +2476,15 @@ def _input_prefix_matches_stored_context(
         return False
     if len(input_value) <= stored_count:
         return False
-    return _fingerprint_input_items(cast(list[JsonValue], input_value)[:stored_count]) == stored_fingerprint
+    prefix = cast(list[JsonValue], input_value)[:stored_count]
+    if _fingerprint_input_items(prefix) == stored_fingerprint:
+        return True
+    # Prior dispatch fingerprints the forwarding representation, which strips
+    # replayed namespaces. Compare that same representation without changing
+    # the client payload or weakening checks on any other field.
+    normalized: dict[str, JsonValue] = {"input": prefix}
+    strip_replayed_tool_call_namespaces_from_payload(normalized)
+    return _fingerprint_input_items(normalized["input"]) == stored_fingerprint
 
 
 def _is_missing_thread_goal_protocol_error(exc: ProxyResponseError) -> bool:

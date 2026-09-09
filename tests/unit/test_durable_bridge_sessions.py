@@ -1659,7 +1659,7 @@ async def test_durable_bridge_forced_generation_advance_fences_same_account_stal
 
 
 @pytest.mark.asyncio
-async def test_durable_bridge_clear_response_anchor_nulls_anchor_fields_but_keeps_turn_state(
+async def test_durable_bridge_clear_response_anchor_retires_anchor_but_keeps_replay_proof_and_turn_state(
     coordinator: DurableBridgeSessionCoordinator,
 ) -> None:
     claimed = await coordinator.claim_live_session(
@@ -1704,9 +1704,9 @@ async def test_durable_bridge_clear_response_anchor_nulls_anchor_fields_but_keep
 
     assert cleared is not None
     assert cleared.latest_response_id is None
-    assert cleared.latest_input_item_count is None
-    assert cleared.latest_input_full_fingerprint is None
-    assert cleared.latest_pending_tool_calls is None
+    assert cleared.latest_input_item_count == 5
+    assert cleared.latest_input_full_fingerprint == "c" * 64
+    assert cleared.latest_pending_tool_calls == {"call_stuck": "function_call"}
     assert cleared.latest_turn_state == "http_turn_stuck"
 
     lookup_by_turn_state = await coordinator.lookup_request_targets(
@@ -3863,3 +3863,50 @@ async def test_reclaimed_detached_row_fences_prior_generation_operations(
         request_text='{"model":"gpt-5.4","input":"new turn"}',
     )
     assert accepted is not None
+
+
+@pytest.mark.parametrize("change", ["none", "account", "epoch", "response", "turn"])
+async def test_poison_abandonment_preserves_replay_proof_only_on_same_fenced_owner(coordinator, change):
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="thread_header",
+        session_key_value="proof-retention",
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=60,
+        account_id="acc-1",
+        model="gpt-6-astra",
+        service_tier=None,
+        latest_turn_state="turn-original",
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp-original",
+        lease_ttl_seconds=60,
+        input_item_count=5,
+        input_full_fingerprint="a" * 64,
+        pending_tool_calls={"call-original": "function_call"},
+    )
+    result = await coordinator.rebind_session_account(
+        session_id=claimed.session_id,
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch + (1 if change == "epoch" else 0),
+        account_id="acc-other" if change == "account" else "acc-1",
+        clear_continuity=True,
+        preserve_replay_proof=True,
+        expected_latest_response_id="resp-other" if change == "response" else "resp-original",
+        expected_latest_turn_state="turn-other" if change == "turn" else "turn-original",
+    )
+    assert result is (change == "none")
+    async with coordinator._session() as session:
+        row = await session.get(HttpBridgeSessionRecord, claimed.session_id)
+        assert row.latest_input_item_count == 5
+        assert row.latest_input_full_fingerprint == "a" * 64
+        assert row.account_id == "acc-1"
+        assert row.latest_response_id == (None if change == "none" else "resp-original")

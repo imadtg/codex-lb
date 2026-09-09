@@ -715,6 +715,95 @@ def test_full_resend_suffix_accepts_only_self_contained_tool_loops(
     )
 
 
+def test_full_resend_tool_manifest_accepts_goal_followup_after_all_results() -> None:
+    stored_input: list[JsonValue] = [{"role": "user", "content": "Inspect the workspace"}]
+    suffix: list[JsonValue] = [
+        {"type": "function_call", "call_id": "call_inspect", "name": "inspect", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_inspect", "output": "Inspection complete"},
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": '<codex_internal_context source="goal">Continue the goal.</codex_internal_context>',
+                }
+            ],
+        },
+    ]
+
+    assert responses_input_suffix_matches_pending_tool_calls(
+        [*stored_input, *suffix],
+        stored_count=len(stored_input),
+        pending_tool_calls={"call_inspect": "function_call"},
+    )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "missing-call",
+        "missing-output",
+        "wrong-call-type",
+        "duplicate-output",
+        "omitted-parallel-call",
+        "leading-user",
+        "interleaved-user",
+        "later-call",
+        "later-developer",
+        "later-assistant",
+        "developer-interleave",
+        "opaque-compaction",
+        "malformed-type",
+    ],
+)
+def test_goal_followup_keeps_exact_tool_manifest_fences(changed: str) -> None:
+    stored: list[JsonValue] = [{"role": "user", "content": "Inspect"}]
+    call: dict[str, JsonValue] = {"type": "custom_tool_call", "call_id": "call_1", "name": "shell", "input": "pwd"}
+    output: dict[str, JsonValue] = {"type": "custom_tool_call_output", "call_id": "call_1", "output": "/workspace"}
+    followup: dict[str, JsonValue] = {"role": "user", "content": [{"type": "input_text", "text": "Continue"}]}
+    developer: dict[str, JsonValue] = {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": "Follow the current task"}],
+        "internal_chat_message_metadata_passthrough": {"turn_id": "turn_current"},
+    }
+    suffix: list[JsonValue] = [call, output, followup]
+    manifest = {"call_1": "custom_tool_call"}
+    if changed == "missing-call":
+        suffix.remove(call)
+    elif changed == "missing-output":
+        suffix.remove(output)
+    elif changed == "wrong-call-type":
+        manifest["call_1"] = "function_call"
+    elif changed == "duplicate-output":
+        suffix.insert(2, output)
+    elif changed == "omitted-parallel-call":
+        manifest["call_2"] = "custom_tool_call"
+    elif changed == "leading-user":
+        suffix.insert(0, followup)
+    elif changed == "interleaved-user":
+        suffix.insert(1, followup)
+    elif changed == "later-call":
+        suffix.append({**call, "call_id": "call_2"})
+    elif changed == "later-developer":
+        suffix.append(developer)
+    elif changed == "later-assistant":
+        suffix.append({"role": "assistant", "content": "Earlier output must precede the new instruction"})
+    elif changed == "developer-interleave":
+        suffix.insert(1, developer)
+    elif changed == "opaque-compaction":
+        suffix.append({"type": "compaction", "encrypted_content": "opaque_owner_checkpoint"})
+    elif changed == "malformed-type":
+        followup["type"] = []
+
+    assert not responses_input_suffix_matches_pending_tool_calls(
+        [*stored, *suffix],
+        stored_count=len(stored),
+        pending_tool_calls=manifest,
+    )
+
+
 def test_full_resend_tool_loop_manifest_tolerates_fresh_developer_interleave_after_historical_one() -> None:
     stored_input: list[JsonValue] = [
         {"role": "user", "content": "first question"},
@@ -2091,6 +2180,130 @@ def test_full_resend_tool_loop_manifest_rejects_call_id_reused_from_stored_prefi
     )
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        "<heartbeat><automation_id>follow-pr</automation_id></heartbeat>",
+        (
+            "<heartbeat><automation_id>follow-pr</automation_id>"
+            "<current_time_iso>2026-09-04T13:58:17Z</current_time_iso></heartbeat>"
+        ),
+    ],
+)
+def test_host_automation_heartbeat_is_account_neutral_fresh_input(output: str) -> None:
+    heartbeat: JsonValue = {
+        "type": "function_call_output",
+        "name": "automation_update",
+        "namespace": "codex_app",
+        "output": output,
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "turn_current",
+            "create_time": 1_788_526_697.25,
+        },
+    }
+
+    assert responses_payload_is_account_neutral_fresh_replay({"input": [heartbeat]})
+    assert responses_input_suffix_retains_prior_output(
+        [
+            {"role": "user", "content": "monitor this"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "Still waiting."}],
+            },
+            heartbeat,
+        ],
+        stored_count=1,
+    )
+
+
+@pytest.mark.parametrize("heartbeat_before_tool_pair", [True, False])
+def test_full_resend_tool_loop_manifest_rejects_host_automation_heartbeat(
+    heartbeat_before_tool_pair: bool,
+) -> None:
+    heartbeat: JsonValue = {
+        "type": "function_call_output",
+        "name": "automation_update",
+        "namespace": "codex_app",
+        "output": "<heartbeat><automation_id>follow-pr</automation_id></heartbeat>",
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "turn_current",
+            "create_time": 1_788_526_697.25,
+        },
+    }
+    tool_pair: list[JsonValue] = [
+        {
+            "type": "function_call",
+            "call_id": "call_pending",
+            "name": "lookup",
+            "arguments": "{}",
+        },
+        {"type": "function_call_output", "call_id": "call_pending", "output": "result"},
+    ]
+    suffix = [heartbeat, *tool_pair] if heartbeat_before_tool_pair else [*tool_pair, heartbeat]
+
+    assert not responses_input_suffix_matches_pending_tool_calls(
+        [{"role": "user", "content": "look that up"}, *suffix],
+        stored_count=1,
+        pending_tool_calls={"call_pending": "function_call"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("name", "other_tool"),
+        ("namespace", "other_host"),
+        ("output", "ordinary tool output"),
+        ("output", "<heartbeat></heartbeat>"),
+        ("output", "<heartbeat><automation_id></automation_id></heartbeat>"),
+        ("output", "<heartbeat><message>not a host trigger</message></heartbeat>"),
+        (
+            "output",
+            "<heartbeat><automation_id>follow-pr</automation_id><current_time_iso></current_time_iso></heartbeat>",
+        ),
+        (
+            "output",
+            "<heartbeat><automation_id>follow-pr</automation_id><message>not a host trigger</message></heartbeat>",
+        ),
+        ("output", " <heartbeat><automation_id>follow-pr</automation_id></heartbeat>"),
+        ("output", "<heartbeat></heartbeat>trailing-data"),
+        ("output", "<heartbeat></heartbeat></heartbeat>"),
+        ("call_id", "call_owner_bound"),
+    ],
+)
+def test_noncanonical_host_automation_output_is_not_account_neutral(field: str, value: str) -> None:
+    heartbeat: dict[str, JsonValue] = {
+        "type": "function_call_output",
+        "name": "automation_update",
+        "namespace": "codex_app",
+        "output": "<heartbeat><automation_id>follow-pr</automation_id></heartbeat>",
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "turn_current",
+            "create_time": 1_788_526_697.25,
+        },
+    }
+    heartbeat[field] = value
+
+    assert not responses_payload_is_account_neutral_fresh_replay({"input": [heartbeat]})
+
+
+def test_host_automation_heartbeat_rejects_oversized_create_time() -> None:
+    heartbeat: JsonValue = {
+        "type": "function_call_output",
+        "name": "automation_update",
+        "namespace": "codex_app",
+        "output": "<heartbeat><automation_id>follow-pr</automation_id></heartbeat>",
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "turn_current",
+            "create_time": 10**400,
+        },
+    }
+
+    assert not responses_payload_is_account_neutral_fresh_replay({"input": [heartbeat]})
+
+
 def test_full_resend_tool_loop_manifest_rejects_call_id_reused_from_unsupported_prefix_item() -> None:
     stored_input: list[JsonValue] = [
         {"role": "user", "content": "first question"},
@@ -2613,3 +2826,46 @@ def test_account_neutral_replay_marker_requires_tagged_existing_hard_kind() -> N
 def test_account_neutral_replay_marker_rejects_empty_nonce() -> None:
     with pytest.raises(ValueError, match="nonce"):
         make_http_bridge_account_neutral_replay_key("")
+
+
+@pytest.mark.parametrize("property_name", ["image_url", "file_id", "container_id", "vector_store_id"])
+def test_namespace_parameter_schema_resource_names_are_not_resource_values(property_name):
+    from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
+
+    tool: dict[str, JsonValue] = {
+        "type": "namespace",
+        "name": "local",
+        "tools": [
+            {
+                "type": "function",
+                "name": "inspect",
+                "parameters": {
+                    "type": "object",
+                    "properties": {property_name: {"type": "string"}},
+                },
+            }
+        ],
+    }
+    payload: dict[str, JsonValue] = {
+        "model": "gpt-6-astra",
+        "input": [{"role": "user", "content": "hello"}],
+        "tools": [tool],
+    }
+    assert responses_payload_is_account_neutral_fresh_replay(payload)
+    children = tool["tools"]
+    assert isinstance(children, list) and isinstance(children[0], dict)
+    children[0][property_name] = "owned-resource"
+    assert not responses_payload_is_account_neutral_fresh_replay(payload)
+
+
+@pytest.mark.parametrize("key", ["external_web_access", "indexed_web_access"])
+@pytest.mark.parametrize("value,expected", [(True, True), (False, True), ("false", False), (1, False), (None, False)])
+def test_web_search_access_flags_are_typed_portable_controls(key, value, expected):
+    from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
+
+    payload: dict[str, JsonValue] = {
+        "model": "gpt-6-astra",
+        "input": [{"role": "user", "content": "hello"}],
+        "tools": [{"type": "web_search", key: value}],
+    }
+    assert responses_payload_is_account_neutral_fresh_replay(payload) is expected

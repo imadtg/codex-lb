@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from app.db.models import Account, AdditionalUsageHistory
+from app.modules.proxy._load_balancer.model_eligibility import CatalogOmissionQuotaAdmission
+
 AccountLeaseKind = Literal["response_create", "stream"]
 
 MAX_SELECTION_ATTEMPTS = 4
@@ -68,3 +71,23 @@ class AccountConcurrencyCaps:
     configured_response_create_limit: int | None = None
     configured_stream_limit: int | None = None
     replica_count: int = 1
+
+
+@dataclass
+class AccountSelection:
+    account: Account | None
+    error_message: str | None
+    error_code: str | None = None
+    resets_at: int | None = None
+    lease: AccountLease | None = None
+    catalog_omission_quota_admission: CatalogOmissionQuotaAdmission | None = None
+    continuity_owner_no_longer_exists: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _AdditionalLimitFilterResult:
+    accounts: list[Account]
+    latest_primary: dict[str, AdditionalUsageHistory]
+    latest_secondary: dict[str, AdditionalUsageHistory]
+    error_code: str | None = None
+    error_message: str | None = None

@@ -7,6 +7,7 @@ import logging
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import TYPE_CHECKING, Iterable
 from uuid import uuid4
 
@@ -66,7 +67,6 @@ from app.db.snapshot import clone_row
 from app.modules.proxy._load_balancer.error_rate import error_rate_weight_multiplier, record_outcome_locked
 from app.modules.proxy._load_balancer.model_eligibility import (
     _ADDITIONAL_QUOTA_EXEMPT_PLAN_TYPES,
-    CatalogOmissionQuotaAdmission,
     _additional_quota_applies_to_plan,  # noqa: F401
     _additional_quota_eligibility,
     _additional_usage_is_exhausted,  # noqa: F401
@@ -76,6 +76,9 @@ from app.modules.proxy._load_balancer.model_eligibility import (
     _latest_additional_by_key,
     _ModelAccountFilterResult,
     _normalize_model_id,  # noqa: F401
+)
+from app.modules.proxy._load_balancer.model_eligibility import (
+    CatalogOmissionQuotaAdmission as CatalogOmissionQuotaAdmission,
 )
 from app.modules.proxy._load_balancer.model_eligibility import (
     _filter_accounts_for_model as _filter_accounts_for_model_impl,
@@ -130,6 +133,10 @@ from app.modules.proxy._load_balancer.types import (
     AccountLeaseKind,
     ProbeReservation,
     RuntimeState,
+    _AdditionalLimitFilterResult,
+)
+from app.modules.proxy._load_balancer.types import (
+    AccountSelection as AccountSelection,
 )
 from app.modules.proxy._load_balancer.unbound_selection import (
     UnboundSelectionRequest,
@@ -164,6 +171,8 @@ from app.modules.usage.mappers import usage_history_to_window_row
 if TYPE_CHECKING:
     from app.modules.accounts.repository import AccountsRepository
     from app.modules.proxy.sticky_repository import StickyOwnerLookup, StickySessionsRepository
+
+from app.modules.proxy.continuity_diagnostics import observe_selection_result
 
 logger = logging.getLogger(__name__)
 
@@ -200,26 +209,6 @@ class _NormalizedUsageInputs:
     effective_secondary_entry: _UsageWindowEntry | None
     secondary_used: float | None
     secondary_reset: int | None
-
-
-@dataclass
-class AccountSelection:
-    account: Account | None
-    error_message: str | None
-    error_code: str | None = None
-    resets_at: int | None = None
-    lease: AccountLease | None = None
-    catalog_omission_quota_admission: CatalogOmissionQuotaAdmission | None = None
-    continuity_owner_no_longer_exists: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class _AdditionalLimitFilterResult:
-    accounts: list[Account]
-    latest_primary: dict[str, AdditionalUsageHistory]
-    latest_secondary: dict[str, AdditionalUsageHistory]
-    error_code: str | None = None
-    error_message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -578,7 +567,6 @@ class LoadBalancer:
     ) -> AccountSelection:
         if (required_account_is_ownership_constraint or required_continuity_owner) and required_account_id is None:
             raise ValueError("required account ownership flags require required_account_id")
-
         excluded_ids = set(exclude_account_ids or ())
         scoped_account_ids = None if account_ids is None else set(account_ids)
         owner_restricted_selection = required_account_is_ownership_constraint or required_continuity_owner
@@ -706,6 +694,14 @@ class LoadBalancer:
             return selection_inputs
 
         selection_inputs = await load_selection_inputs()
+        finish_selection = partial(
+            observe_selection_result,
+            required_account_id=required_account_id,
+            model=model,
+            candidate_count=len(selection_inputs.accounts),
+            excluded_count=len(excluded_ids),
+            owner_restricted=owner_restricted_selection,
+        )
         caps = concurrency_caps or effective_account_concurrency_caps()
         circuit_breaker_open = _is_upstream_circuit_breaker_open()
         if circuit_breaker_open:
@@ -721,11 +717,13 @@ class LoadBalancer:
             CONTINUITY_OWNER_UNAVAILABLE,
             CONTINUITY_OWNER_POLICY_CONFLICT,
         }:
-            return AccountSelection(
-                account=None,
-                error_message=selection_inputs.error_message,
-                error_code=selection_inputs.error_code,
-                continuity_owner_no_longer_exists=selection_inputs.error_code == CONTINUITY_OWNER_UNAVAILABLE,
+            return finish_selection(
+                AccountSelection(
+                    account=None,
+                    error_message=selection_inputs.error_message,
+                    error_code=selection_inputs.error_code,
+                    continuity_owner_no_longer_exists=selection_inputs.error_code == CONTINUITY_OWNER_UNAVAILABLE,
+                )
             )
 
         selected_snapshot: Account | None = None
@@ -778,10 +776,12 @@ class LoadBalancer:
                         # The required owner came from a file/response/bridge index,
                         # while the raw row may be legacy turn-state ownership. Neither
                         # source can be discarded or rewritten to resolve a conflict.
-                        return AccountSelection(
-                            account=None,
-                            error_message="Account-owned continuity sources conflict; retry the logical turn",
-                            error_code="continuity_owner_conflict",
+                        return finish_selection(
+                            AccountSelection(
+                                account=None,
+                                error_message="Account-owned continuity sources conflict; retry the logical turn",
+                                error_code="continuity_owner_conflict",
+                            )
                         )
                     owner_snapshot_pinned = True
                 if sticky_seed_key is not None and sticky_seed_kind is not None:
@@ -815,19 +815,23 @@ class LoadBalancer:
             and legacy_existing_account_id is None
             and len(selection_inputs.effective_continuity_owner_candidates) != 1
         ):
-            return AccountSelection(
-                account=None,
-                error_message=_AMBIGUOUS_CONVERSATION_OWNER_MESSAGE,
-                error_code=_AMBIGUOUS_CONVERSATION_OWNER_CODE,
+            return finish_selection(
+                AccountSelection(
+                    account=None,
+                    error_message=_AMBIGUOUS_CONVERSATION_OWNER_MESSAGE,
+                    error_code=_AMBIGUOUS_CONVERSATION_OWNER_CODE,
+                )
             )
         # Transient routing errors are secondary to ownership ambiguity. An
         # empty additional-quota pool cannot prove which account owns a
         # conversation that was ambiguous before that filter ran.
         if selection_inputs.error_code is not None and not selection_inputs.accounts:
-            return AccountSelection(
-                account=None,
-                error_message=selection_inputs.error_message,
-                error_code=selection_inputs.error_code,
+            return finish_selection(
+                AccountSelection(
+                    account=None,
+                    error_message=selection_inputs.error_message,
+                    error_code=selection_inputs.error_code,
+                )
             )
         if sticky_key is None:
             unbound_outcome = await run_unbound_selection_path(
@@ -863,10 +867,12 @@ class LoadBalancer:
             selection_error_code = unbound_outcome.error_code
             selection_resets_at = unbound_outcome.resets_at
             if unbound_outcome.disposition == "direct_error":
-                return AccountSelection(
-                    account=None,
-                    error_message=error_message,
-                    error_code=selection_error_code,
+                return finish_selection(
+                    AccountSelection(
+                        account=None,
+                        error_message=error_message,
+                        error_code=selection_error_code,
+                    )
                 )
             if (
                 selected_snapshot is not None
@@ -929,6 +935,7 @@ class LoadBalancer:
                     record_account_cap_rejection=_record_account_cap_rejection,
                     allow_usage_exhaustion_error=allow_usage_exhaustion_error,
                     initial_sticky_owner_lookup=initial_sticky_owner_lookup,
+                    excluded_account_ids=frozenset(excluded_ids),
                 ),
             )
             selection_inputs = sticky_outcome.selection_inputs
@@ -938,10 +945,12 @@ class LoadBalancer:
             selection_error_code = sticky_outcome.error_code
             selection_resets_at = sticky_outcome.resets_at
             if sticky_outcome.disposition == "direct_error":
-                return AccountSelection(
-                    account=None,
-                    error_message=error_message,
-                    error_code=selection_error_code,
+                return finish_selection(
+                    AccountSelection(
+                        account=None,
+                        error_message=error_message,
+                        error_code=selection_error_code,
+                    )
                 )
 
         if selected_snapshot is None:
@@ -961,18 +970,22 @@ class LoadBalancer:
                 and error_message.startswith("opportunistic burn window closed")
             )
             if opportunistic_policy_blocked:
-                return AccountSelection(
-                    account=None,
-                    error_message=error_message,
-                    error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED,
+                return finish_selection(
+                    AccountSelection(
+                        account=None,
+                        error_message=error_message,
+                        error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED,
+                    )
                 )
             if required_continuity_owner and selection_error_code is None:
                 selection_error_code = CONTINUITY_OWNER_UNAVAILABLE
             if traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC and error_message and selection_error_code is None:
-                return AccountSelection(
-                    account=None,
-                    error_message=error_message,
-                    error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED,
+                return finish_selection(
+                    AccountSelection(
+                        account=None,
+                        error_message=error_message,
+                        error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED,
+                    )
                 )
             if error_message == "No available accounts" and not owner_restricted_selection:
                 set_degraded("all upstream accounts are unavailable")
@@ -983,11 +996,13 @@ class LoadBalancer:
                 and (selection_inputs.accounts or selection_inputs.error_code is not None)
             ):
                 set_normal()
-            return AccountSelection(
-                account=None,
-                error_message=error_message,
-                error_code=selection_error_code,
-                resets_at=selection_resets_at,
+            return finish_selection(
+                AccountSelection(
+                    account=None,
+                    error_message=error_message,
+                    error_code=selection_error_code,
+                    resets_at=selection_resets_at,
+                )
             )
         if not circuit_breaker_open:
             set_normal()
@@ -998,20 +1013,22 @@ class LoadBalancer:
             bool(sticky_key),
             model,
         )
-        return AccountSelection(
-            account=selected_snapshot,
-            error_message=None,
-            error_code=None,
-            lease=selected_lease,
-            catalog_omission_quota_admission=_catalog_omission_quota_admission(
-                account_id=selected_snapshot.id,
-                model=model,
-                service_tier=service_tier,
-                additional_limit_name=additional_limit_name,
-                quota_admitted_catalog_omission_account_ids=(
-                    selection_inputs.quota_admitted_catalog_omission_account_ids
+        return finish_selection(
+            AccountSelection(
+                account=selected_snapshot,
+                error_message=None,
+                error_code=None,
+                lease=selected_lease,
+                catalog_omission_quota_admission=_catalog_omission_quota_admission(
+                    account_id=selected_snapshot.id,
+                    model=model,
+                    service_tier=service_tier,
+                    additional_limit_name=additional_limit_name,
+                    quota_admitted_catalog_omission_account_ids=(
+                        selection_inputs.quota_admitted_catalog_omission_account_ids
+                    ),
                 ),
-            ),
+            )
         )
 
     def _reserve_due_probe_locked(

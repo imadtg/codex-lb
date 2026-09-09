@@ -3925,7 +3925,9 @@ async def test_hard_codex_session_owner_outside_selection_pool_fails_closed(scop
         )
 
     assert selected.account is None
-    assert selected.error_code == "hard_affinity_saturated"
+    assert selected.error_code == (
+        "hard_affinity_owner_excluded" if scope_mode == "excluded" else "hard_affinity_saturated"
+    )
     assert sticky_repo.account_id == owner.id
     assert sticky_repo.deleted == []
     assert sticky_repo.upserts == []

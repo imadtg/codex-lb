@@ -42,6 +42,7 @@ from app.modules.proxy._load_balancer.types import (
     RuntimeState,
 )
 from app.modules.proxy.affinity import _CodexSessionSource
+from app.modules.proxy.continuity_diagnostics import record_candidate_states
 from app.modules.proxy.fair_share import (
     API_KEY_STREAM_FAIR_SHARE_ERROR_CODE,
     FairShareDecision,
@@ -246,6 +247,7 @@ class StickySelectionRequest(Generic[SelectionInputsT]):
     selection_inputs: SelectionInputsT
     reload_inputs: Callable[[], Awaitable[SelectionInputsT]]
     record_account_cap_rejection: AccountCapRejectionCallback
+    excluded_account_ids: frozenset[str] = frozenset()
     allow_usage_exhaustion_error: bool = True
     api_key_id: str | None = None
     api_key_stream_fair_share_threshold_pct: int = 0
@@ -474,6 +476,12 @@ async def run_sticky_selection_path(
                     account=None,
                     error_message="Account-owned continuity sources conflict; retry the logical turn",
                     error_code="continuity_owner_conflict",
+                )
+            if hard_sticky and sticky_existing_account_id in request.excluded_account_ids:
+                return _direct_error(
+                    account=None,
+                    error_message="Hard affinity owner was excluded by this attempt; restart with full history",
+                    error_code="hard_affinity_owner_excluded",
                 )
             # A resolved hard row proves ownership. Without one, use the
             # same pre-health/pre-cap pool as the no-sticky path above.
@@ -1225,6 +1233,7 @@ async def _select_with_stickiness(
     overload_backoff_runtime: Mapping[str, RuntimeState] | None = None,
     clock: Clock,
 ) -> _StickySelectionOutcome:
+    record_candidate_states(states)
     if not sticky_key or not sticky_repo:
         return _StickySelectionOutcome(
             selection=_select_account_preferring_budget_safe(

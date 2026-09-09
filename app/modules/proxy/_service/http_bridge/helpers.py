@@ -70,7 +70,7 @@ from app.core.openai.requests import (
 )
 from app.core.resilience.overload import local_overload_error
 from app.core.types import JsonValue
-from app.core.utils.request_id import get_request_id
+from app.core.utils.request_id import get_request_id, get_request_scope_id
 from app.core.utils.shared_future import _await_task_deferring_cancellation, wait_on_shared_future
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.core.utils.time import to_utc_naive, utcnow
@@ -185,6 +185,7 @@ from app.modules.proxy.continuity import (
     is_http_bridge_account_neutral_replay,
     make_http_bridge_account_neutral_replay_key,
 )
+from app.modules.proxy.continuity_diagnostics import correlation_hash
 from app.modules.proxy.durable_bridge_coordinator import (
     DurableBridgeLookup,
 )
@@ -3807,7 +3808,7 @@ def _log_http_bridge_event(
         "http_bridge_event event=%s bridge_kind=%s bridge_key=%s account_id=%s"
         " model=%s pending=%s detail=%s cache_key_family=%s model_class=%s"
         " key_strength=%s owner_check_applied=%s error_message=%s upstream_close_code=%s"
-        " response_events_seen=%s transport_classification=%s",
+        " response_events_seen=%s transport_classification=%s observer_request=%s observer_scope=%s",
         event,
         key.affinity_kind,
         _hash_identifier(key.affinity_key),
@@ -3823,6 +3824,8 @@ def _log_http_bridge_event(
         upstream_close_code,
         response_events_seen,
         transport_classification,
+        correlation_hash(get_request_id()),
+        correlation_hash(get_request_scope_id()),
     )
 
 
