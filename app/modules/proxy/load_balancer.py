@@ -69,6 +69,7 @@ from app.modules.proxy._load_balancer.error_rate import (
     error_rate_weight_multiplier,
     record_outcome_locked,
 )
+from app.modules.proxy._load_balancer.latency_cohort import apply_latency_cohort_weights
 from app.modules.proxy._load_balancer.model_eligibility import (
     _ADDITIONAL_QUOTA_EXEMPT_PLAN_TYPES,
     CatalogOmissionQuotaAdmission,
@@ -136,7 +137,6 @@ from app.modules.proxy._load_balancer.sticky_selection import (
 from app.modules.proxy._load_balancer.sticky_selection import (
     _state_above_sticky_budget_threshold as _state_above_sticky_budget_threshold,
 )
-from app.modules.proxy._load_balancer.ttft_cohort import apply_ttft_cohort_weights
 from app.modules.proxy._load_balancer.tunables import (
     RoutingTunables,
     account_lease_stale_ttl_seconds,
@@ -897,6 +897,7 @@ class LoadBalancer:
                     routing_tunables=tunables,
                     api_key_id=api_key_id,
                     api_key_stream_fair_share_threshold_pct=api_key_stream_fair_share_threshold_pct,
+                    model=model,
                     selection_inputs=selection_inputs,
                     reload_inputs=load_selection_inputs,
                     record_account_cap_rejection=_record_account_cap_rejection,
@@ -972,6 +973,7 @@ class LoadBalancer:
                     redact_sensitive_details=redact_sensitive_details,
                     api_key_id=api_key_id,
                     api_key_stream_fair_share_threshold_pct=api_key_stream_fair_share_threshold_pct,
+                    model=model,
                     selection_inputs=selection_inputs,
                     reload_inputs=load_selection_inputs,
                     record_account_cap_rejection=_record_account_cap_rejection,
@@ -1618,6 +1620,7 @@ class LoadBalancer:
         redact_sensitive_details: bool,
         routing_tunables: RoutingTunables,
         soft_drain_enabled: bool | None = None,
+        model: str | None = None,
     ) -> tuple[list[AccountState], dict[str, Account]]:
         self._reclaim_stale_account_leases_locked(
             routing_tunables=routing_tunables,
@@ -1642,6 +1645,7 @@ class LoadBalancer:
                 if soft_drain_enabled is not None
                 else getattr(selection_inputs, "soft_drain_enabled", None)
             ),
+            model=model,
         )
         if required_account_id is None:
             return states, account_map
@@ -2115,6 +2119,7 @@ def _build_states(
     encryptor: TokenEncryptor | None = None,
     routing_tunables: RoutingTunables | None = None,
     soft_drain_enabled: bool | None = None,
+    model: str | None = None,
     log_weight_transitions: bool = True,
 ) -> tuple[list[AccountState], dict[str, Account]]:
     now = REAL_CLOCK.time() if now is None else now
@@ -2150,7 +2155,7 @@ def _build_states(
         state.ignore_standard_quota = account.id in ignore_standard_quota_account_ids
         states.append(state)
         account_map[account.id] = account
-    apply_ttft_cohort_weights(states, runtime, now=now, log_transitions=log_weight_transitions)
+    apply_latency_cohort_weights(states, runtime, now=now, model=model, log_transitions=log_weight_transitions)
     return states, account_map
 
 
