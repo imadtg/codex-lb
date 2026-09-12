@@ -1,0 +1,6 @@
+- [ ] Inventory local changes against beta.8 implementations.
+- [ ] Run portable scenarios against unmodified beta.8 and retain baseline evidence.
+- [ ] Preserve public-process tests and port only missing behavior.
+- [ ] Validate candidate, negative controls, upstream bridge tests, and migrations on disposable data.
+- [ ] Document retained/replaced changes, sync specs and archive after validation.
+- [ ] Build frontend and deploy validated candidate.

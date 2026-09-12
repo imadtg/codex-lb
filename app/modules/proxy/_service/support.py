@@ -48,6 +48,7 @@ from app.modules.proxy.load_balancer import (
     AccountSelection,
     CatalogOmissionQuotaAdmission,
 )
+from app.modules.proxy.replay_sequence import ReplaySequence
 from app.modules.proxy.tool_call_dedupe import ToolCallDedupeKey
 from app.modules.proxy.work_admission import AdmissionLease
 
@@ -317,7 +318,7 @@ def _finalize_ttft_latency_ms(
 
 
 # Stream frames whose parsed payload feeds a real per-event consumer:
-# lifecycle/terminal handling and usage settlement (created/in_progress/
+# lifecycle/terminal handling and usage settlement (created/queued/in_progress/
 # completed/failed/incomplete/error), parallel tool-call rewrite + duplicate
 # side-effect suppression (response.output_item.*), and text-done suppression
 # (response.output_text.done / response.content_part.done). Canonically framed
@@ -326,6 +327,7 @@ def _finalize_ttft_latency_ms(
 _MUST_PARSE_STREAM_EVENT_TYPES = frozenset(
     {
         "response.created",
+        "response.queued",
         "response.in_progress",
         "response.completed",
         "response.failed",
@@ -1277,6 +1279,8 @@ class _WebSocketRequestState:
     client_ip: str | None = None
     downstream_visible: bool = False
     last_downstream_sequence_number: int | None = None
+    replay_sequence: ReplaySequence | None = None
+    verified_prewarm_replay: bool = False
     # Confirmed pre-dispatch account-route failures must not mutate account
     # health while this request's API-key reservation is still live. The
     # account objects are keyed by id so repeated connect attempts cannot
@@ -1550,6 +1554,10 @@ def _http_bridge_session_supports_service_tier(
 
 @dataclass(slots=True)
 class _WebSocketContinuityState:
+    completed_prewarm_response_id: str | None = None
+    completed_prewarm_input_count: int = 0
+    completed_prewarm_input_fingerprint: str | None = None
+    completed_prewarm_request_text: str | None = None
     last_completed_input_count: int = 0
     last_completed_response_id: str | None = None
     last_completed_input_prefix_fingerprint: str | None = None
@@ -1776,9 +1784,8 @@ def _websocket_request_is_accepted_lifecycle_only(request_state: _WebSocketReque
     This predicate describes the upstream lifecycle only. Downstream sequence
     exposure (``last_downstream_sequence_number``) is judged by the callers:
     ``_websocket_request_can_replay_before_visible_output`` and the accepted
-    capacity classifier both keep refusing a sequenced request, so the direct
-    websocket surface never replays after a finite ``sequence_number`` frame
-    was forwarded.
+    capacity classifier decides whether to install an explicit replacement
+    sequence mapping. Transport-close replay keeps its stricter sequence guard.
     """
     if request_state.response_id is None or request_state.awaiting_response_created:
         return False

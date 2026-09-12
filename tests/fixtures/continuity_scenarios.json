@@ -1,0 +1,23 @@
+[
+  {"id":"quota_bridge_namespace_plain_prefix","sources":["C2","U2"],"kind":"client_contract","expectation":"Replay preserves namespaced function and matching result."},
+  {"id":"quota_bridge_plain_prefix","sources":["U1","U2"],"kind":"recovery_contract","expectation":"Pre-created quota rejection uses alternate without historical metadata as a confounder."},
+  {"id":"quota_bridge_agent_message_plain_prefix","sources":["L2","U2"],"kind":"incident_reduction","expectation":"Plaintext agent history remains usable without historical developer metadata."},
+  {"id":"quota_bridge_visible_failure","sources":["U2","D1"],"kind":"safety_control","expectation":"Visible text is delivered once; quota error does not trigger cross-account replay."},
+  {"id":"quota_bridge_healthy","sources":["U1"],"kind":"healthy_control","expectation":"Ordinary continuation succeeds on the healthy original owner."},
+  {"id":"quota_bridge_replacement_exhausted","sources":["L1","C1"],"kind":"incident_reduction","expectation":"Failed replacement cannot strand identical history when a third account becomes eligible."},
+  {"id":"fresh_prewarm_capacity","sources":["C1"],"kind":"proposed_recovery","expectation":"Real prewarm suffix can recover capacity with one coherent downstream response."},
+  {"id":"quota_bridge_turn_state_suffix_agent_chain","sources":["L2","C1"],"kind":"incident_reduction","expectation":"Two successive handoffs retain later plaintext agent input and original client turn token."},
+  {"id":"quota_bridge_turn_state_suffix_agent","sources":["L2","C1"],"kind":"incident_reduction","expectation":"Plaintext agent delivery after settled tool output does not prevent quota handoff."},
+  {"id":"quota_bridge_turn_state_suffix_agent_encrypted","sources":["L2"],"kind":"conservative_policy","expectation":"Opaque agent suffix does not qualify through the plaintext portability path."},
+  {"id":"quota_bridge_turn_state_suffix_agent_missing_output","sources":["D1","L2"],"kind":"adversarial_control","expectation":"Agent delivery cannot replace a missing tool result."},
+  {"id":"owner_unavailable","sources":["U1","U3"],"kind":"current_contract","expectation":"An anchor-only delta cannot be relocated without history reconstruction."},
+  {"id":"quota_bridge","sources":["U1","L2"],"kind":"incident_reduction","expectation":"Historical developer instructions survive a full-history quota handoff and follow-up."},
+  {"id":"quota_status_agent_message","sources":["L2","U2"],"kind":"transport_control","expectation":"HTTP quota rejection with plaintext agent history can hand off."},
+  {"id":"quota_bridge_failed_event","sources":["U2"],"kind":"provider_compatibility_unverified","expectation":"ID-less pre-created response.failed quota envelope is recoverable; exact raw upstream provenance remains unverified."},
+  {"id":"quota_bridge_turn_state_agent_message_chain","sources":["L2","C1"],"kind":"lifecycle_control","expectation":"Agent input in the stored prefix survives two handoffs."},
+  {"id":"quota_bridge_turn_state_chain_reconnect","sources":["C1","U1"],"kind":"lifecycle_control","expectation":"A replacement reconnect after completion stays on its owner and later handoff works."},
+  {"id":"quota_bridge_turn_state_changed_prefix","sources":["L2"],"kind":"proof_boundary","expectation":"A mismatched history does not reuse proof of the old prefix."},
+  {"id":"quota_bridge_turn_state_missing_output","sources":["D1"],"kind":"adversarial_control","expectation":"A missing result cannot be hidden by later user input."},
+  {"id":"quota_bridge_turn_state_agent_message_encrypted","sources":["L2"],"kind":"conservative_policy","expectation":"Opaque agent content in the stored prefix does not qualify as plaintext."},
+  {"id":"quota_bridge_turn_state_accepted_failure","sources":["U2"],"kind":"safety_control","expectation":"Created response does not enter the pre-created quota handoff path."}
+]

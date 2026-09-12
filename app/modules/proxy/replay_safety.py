@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import re
 from collections import deque
 from collections.abc import Container, Mapping
 from dataclasses import dataclass
@@ -11,6 +13,7 @@ from urllib.parse import urlsplit
 from app.core.openai.requests import extract_input_file_ids
 from app.core.types import JsonValue
 from app.modules.model_sources.projection import DeclineReason, PortabilityView
+from app.modules.proxy.continuity_diagnostics import record_continuity_decision
 
 _TOOL_CALL_TYPE_BY_OUTPUT_TYPE = {
     "function_call_output": "function_call",
@@ -22,12 +25,56 @@ _ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES = frozenset(
     {"reasoning", "tool_search_call", "tool_search_output", "web_search_call"}
 )
 _INTERNAL_CHAT_MESSAGE_METADATA_FIELD = "internal_chat_message_metadata_passthrough"
-_ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id"})
+_ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id", "content_item_kinds"})
+_HOST_AUTOMATION_HEARTBEAT_FIELDS = frozenset(
+    {"internal_chat_message_metadata_passthrough", "name", "namespace", "output", "type"}
+)
+_HOST_AUTOMATION_HEARTBEAT_METADATA_FIELDS = frozenset({"create_time", "turn_id"})
+_HOST_AUTOMATION_HEARTBEAT_OUTPUT_RE = re.compile(
+    r"<heartbeat><automation_id>[^<>\s]+</automation_id>"
+    r"(?:<current_time_iso>[^<>\s]+</current_time_iso>)?</heartbeat>"
+)
+
+
+def _is_host_automation_heartbeat_input(item: Mapping[str, JsonValue]) -> bool:
+    """Recognize the account-neutral trigger injected by Codex scheduled tasks."""
+
+    if set(item) != _HOST_AUTOMATION_HEARTBEAT_FIELDS:
+        return False
+    if (
+        item.get("type") != "function_call_output"
+        or item.get("name") != "automation_update"
+        or item.get("namespace") != "codex_app"
+    ):
+        return False
+    output = item.get("output")
+    if not isinstance(output, str):
+        return False
+    if _HOST_AUTOMATION_HEARTBEAT_OUTPUT_RE.fullmatch(output) is None:
+        return False
+    metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+    if not isinstance(metadata, dict) or set(metadata) != _HOST_AUTOMATION_HEARTBEAT_METADATA_FIELDS:
+        return False
+    create_time = metadata.get("create_time")
+    if not isinstance(create_time, (int, float)) or isinstance(create_time, bool):
+        return False
+    try:
+        finite_create_time = math.isfinite(create_time)
+    except OverflowError:
+        return False
+    return _is_nonblank_string(metadata.get("turn_id")) and finite_create_time and create_time > 0
+
+
 _ACCOUNT_NEUTRAL_TOOL_TYPES = frozenset({"custom", "function", "web_search", "web_search_preview"})
+# Local namespaces are portable between Codex accounts, but not to model sources.
+_CODEX_ACCOUNT_NEUTRAL_TOOL_TYPES = _ACCOUNT_NEUTRAL_TOOL_TYPES | {"namespace"}
 _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS = {
-    "custom": frozenset({"description", "format", "name", "type"}),
-    "function": frozenset({"description", "name", "parameters", "strict", "type"}),
-    "web_search": frozenset({"filters", "search_context_size", "type", "user_location"}),
+    "custom": frozenset({"description", "format", "name", "type", "defer_loading"}),
+    "function": frozenset({"description", "name", "parameters", "strict", "type", "defer_loading"}),
+    "namespace": frozenset({"description", "name", "tools", "type"}),
+    "web_search": frozenset(
+        {"filters", "search_context_size", "type", "user_location", "external_web_access", "indexed_web_access"}
+    ),
     "web_search_preview": frozenset({"filters", "search_context_size", "type", "user_location"}),
 }
 _ACCOUNT_NEUTRAL_TOOL_CHOICE_STRINGS = frozenset({"auto", "none", "required"})
@@ -50,6 +97,7 @@ _ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES = frozenset(
         "message",
     }
 )
+_CODEX_ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES = _ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES | {"agent_message"}
 _ACCOUNT_NEUTRAL_MESSAGE_CONTENT_TYPES = frozenset(
     {"input_file", "input_image", "input_text", "output_text", "refusal", "text"}
 )
@@ -83,13 +131,33 @@ _ACCOUNT_NEUTRAL_INPUT_ITEM_FIELDS = {
         {"call_id", "caller", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "output", "status", "type"}
     ),
     "custom_tool_call": frozenset(
-        {"call_id", "caller", "id", "input", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "name", "status", "type"}
+        {
+            "call_id",
+            "caller",
+            "id",
+            "input",
+            _INTERNAL_CHAT_MESSAGE_METADATA_FIELD,
+            "name",
+            "namespace",
+            "status",
+            "type",
+        }
     ),
     "custom_tool_call_output": frozenset(
         {"call_id", "caller", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "output", "status", "type"}
     ),
     "function_call": frozenset(
-        {"arguments", "call_id", "caller", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "name", "status", "type"}
+        {
+            "arguments",
+            "call_id",
+            "caller",
+            "id",
+            _INTERNAL_CHAT_MESSAGE_METADATA_FIELD,
+            "name",
+            "namespace",
+            "status",
+            "type",
+        }
     ),
     "function_call_output": frozenset(
         {"call_id", "caller", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "output", "status", "type"}
@@ -101,9 +169,14 @@ _ACCOUNT_NEUTRAL_APPLY_PATCH_OPERATION_FIELDS = {
     "delete_file": frozenset({"path", "type"}),
     "update_file": frozenset({"diff", "path", "type"}),
 }
-_ACCOUNT_NEUTRAL_REASONING_CONFIG_FIELDS = frozenset({"effort", "summary"})
+_ACCOUNT_NEUTRAL_REASONING_CONFIG_FIELDS = frozenset({"effort", "summary", "context"})
 _ACCOUNT_NEUTRAL_CLIENT_METADATA_FIELDS = frozenset(
     {
+        "session_id",
+        "thread_id",
+        "turn_id",
+        "parent_turn_id",
+        "root_turn_id",
         "ws_request_header_x_openai_internal_codex_responses_lite",
         "x-codex-installation-id",
         "x-codex-parent-thread-id",
@@ -275,22 +348,36 @@ def _project_account_neutral_replay_item(
 
 
 def responses_input_items_are_self_contained_fresh_replay(input_items: list[JsonValue]) -> bool:
+    return responses_input_replay_rejection_reason(input_items) is None
+
+
+def responses_input_replay_rejection_reason(input_items: list[JsonValue]) -> str | None:
+    """Return the actual failed lifecycle gate without retaining any item values."""
     unsettled_call_ids_by_type: dict[str, set[str]] = {item_type: set() for item_type in _TOOL_CALL_TYPES}
     seen_call_ids: set[str] = set()
     settled_call_ids: set[str] = set()
     for item in input_items:
         if not isinstance(item, dict):
-            return False
+            return "input_item_not_object"
+        if _is_host_automation_heartbeat_input(item):
+            if any(unsettled_call_ids_by_type.values()):
+                return "input_heartbeat_before_tool_settlement"
+            continue
         if "type" in item and not _is_nonblank_string(item.get("type")):
-            return False
+            return "input_type_invalid"
         if item.get("id") not in (None, ""):
-            return False
+            return "input_response_owned_id"
+        if item.get("type") == "agent_message":
+            rejection = _agent_message_replay_rejection_reason(item)
+            if rejection is not None:
+                return rejection
+            continue
         if not _internal_chat_message_metadata_is_account_neutral(item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)):
-            return False
+            return "input_metadata"
         item_type_value = item.get("type")
         item_type = item_type_value if isinstance(item_type_value, str) else None
         if not _input_item_has_only_known_fields(item, item_type):
-            return False
+            return "input_unknown_fields"
         call_id_value = item.get("call_id")
         call_id = call_id_value if isinstance(call_id_value, str) and call_id_value else None
         if item_type in _TOOL_CALL_TYPES:
@@ -300,7 +387,7 @@ def responses_input_items_are_self_contained_fresh_replay(input_items: list[Json
                 or not _caller_is_self_contained(item)
                 or not _tool_call_is_self_contained(item_type, item)
             ):
-                return False
+                return "input_tool_call_invalid_or_duplicate"
             seen_call_ids.add(call_id)
             unsettled_call_ids_by_type[item_type].add(call_id)
             continue
@@ -313,10 +400,48 @@ def responses_input_items_are_self_contained_fresh_replay(input_items: list[Json
                 or not _caller_is_self_contained(item)
                 or not _tool_output_is_self_contained(item_type or "", item)
             ):
-                return False
+                return "input_tool_output_unmatched_or_invalid"
             unsettled_call_ids_by_type[call_item_type].remove(call_id)
             settled_call_ids.add(call_id)
-    return all(not call_ids for call_ids in unsettled_call_ids_by_type.values())
+    return "input_unsettled_tool_calls" if any(unsettled_call_ids_by_type.values()) else None
+
+
+def _agent_message_replay_rejection_reason(item: Mapping[str, JsonValue]) -> str | None:
+    # Agent messages are native Codex history, not ordinary role messages.
+    # Preserve author/recipient semantics; never discard opaque content.
+    if set(item) - {"type", "id", "author", "recipient", "content", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD}:
+        return "agent_message_fields"
+    if not _is_nonblank_string(item.get("author")) or not _is_nonblank_string(item.get("recipient")):
+        return "agent_message_routing"
+    content = item.get("content")
+    if (
+        not isinstance(content, list)
+        or not content
+        or not all(
+            isinstance(part, dict)
+            and set(part) == {"type", "text"}
+            and part.get("type") == "input_text"
+            and _is_nonblank_string(part.get("text"))
+            for part in content
+        )
+    ):
+        return "agent_message_content"
+    metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+    if metadata is not None:
+        if not isinstance(metadata, dict) or not metadata or set(metadata) - {"turn_id", "create_time"}:
+            return "agent_message_metadata"
+        if "turn_id" in metadata and not _is_nonblank_string(metadata["turn_id"]):
+            return "agent_message_metadata"
+        if "create_time" in metadata:
+            value = metadata["create_time"]
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+                return "agent_message_metadata"
+            try:
+                if not math.isfinite(value):
+                    return "agent_message_metadata"
+            except OverflowError:
+                return "agent_message_metadata"
+    return None
 
 
 def _internal_chat_message_metadata_is_account_neutral(value: JsonValue | None) -> bool:
@@ -324,8 +449,16 @@ def _internal_chat_message_metadata_is_account_neutral(value: JsonValue | None) 
         return True
     return (
         isinstance(value, dict)
-        and set(value) == _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS
-        and _is_nonblank_string(value.get("turn_id"))
+        and bool(value)
+        and set(value) <= _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS
+        and ("turn_id" not in value or _is_nonblank_string(value.get("turn_id")))
+        and (
+            "content_item_kinds" not in value
+            or (
+                isinstance(value["content_item_kinds"], list)
+                and all(_is_nonblank_string(kind) for kind in value["content_item_kinds"])
+            )
+        )
     )
 
 
@@ -334,6 +467,7 @@ def responses_input_suffix_retains_prior_output(
     *,
     stored_count: int,
     canonical_lite_developer_index: int | None = None,
+    fingerprint_verified_prefix: bool = False,
 ) -> bool:
     """Prove that a stored input prefix is followed by prior output and new input."""
 
@@ -342,6 +476,7 @@ def responses_input_suffix_retains_prior_output(
     prefix_state = _direct_tool_call_prefix_state(
         input_items[:stored_count],
         canonical_lite_developer_index=canonical_lite_developer_index,
+        fingerprint_verified_prefix=fingerprint_verified_prefix,
     )
     if prefix_state is None:
         return False
@@ -359,6 +494,13 @@ def responses_input_suffix_retains_prior_output(
         if "type" in item and not _is_nonblank_string(item_type_value):
             return False
         item_type = item_type_value if isinstance(item_type_value, str) else None
+        if _is_host_automation_heartbeat_input(item):
+            if not retained_output_seen or pending_suffix_calls:
+                return False
+            fresh_followup_seen = True
+            fresh_followup_count += 1
+            fresh_followup_is_user_message = False
+            continue
         if item_type in _TOOL_CALL_TYPES:
             if item.get("status") not in (None, "completed"):
                 return False
@@ -396,6 +538,17 @@ def responses_input_suffix_retains_prior_output(
             fresh_followup_count = 0
             fresh_followup_is_user_message = False
             continue
+        if item_type == "agent_message":
+            if pending_suffix_calls or not _is_fresh_followup_input(item):
+                return False
+            # An external agent delivery is input, never retained upstream
+            # output. It may occur between settled historical tool batches
+            # and a later answer, but cannot establish that answer's proof.
+            if retained_output_seen:
+                fresh_followup_seen = True
+                fresh_followup_count += 1
+                fresh_followup_is_user_message = False
+            continue
         if _is_fresh_followup_input(item):
             if not retained_output_seen or pending_suffix_calls:
                 return False
@@ -424,6 +577,7 @@ def responses_input_suffix_matches_pending_tool_calls(
     stored_count: int,
     pending_tool_calls: Mapping[str, str],
     canonical_lite_developer_index: int | None = None,
+    fingerprint_verified_prefix: bool = False,
 ) -> bool:
     """Prove the suffix exactly settles the durable prior-response call manifest."""
 
@@ -433,6 +587,7 @@ def responses_input_suffix_matches_pending_tool_calls(
         input_items[:stored_count],
         allow_historical_developer_interleave=True,
         canonical_lite_developer_index=canonical_lite_developer_index,
+        fingerprint_verified_prefix=fingerprint_verified_prefix,
     )
     if prefix_state is None or prefix_state[0] or prefix_state[1] & pending_tool_calls.keys():
         return False
@@ -444,12 +599,43 @@ def responses_input_suffix_matches_pending_tool_calls(
         and _fresh_developer_interleave_is_bounded(suffix, index=1)
     ):
         suffix = [suffix[0], suffix[2]]
+    # A goal restart or steer can append user input after a fully settled
+    # prior-response tool batch. Prove that batch independently: new input
+    # must not stand in for a missing parallel call or interrupt its results.
+    first_followup = next(
+        (index for index, item in enumerate(suffix) if isinstance(item, dict) and _is_fresh_followup_input(item)),
+        len(suffix),
+    )
+    followups = suffix[first_followup:]
+    if not all(isinstance(item, dict) and _is_fresh_followup_input(item) for item in followups):
+        # A broad thread alias may still point to an older tool response after
+        # a recovery lane completed later turns. Prove the original exact
+        # batch below, then validate those later completed turns normally.
+        # New user input cannot substitute for a missing call in that batch.
+        first_later_response = next(
+            (
+                index
+                for index, item in enumerate(followups)
+                if not (isinstance(item, dict) and _is_fresh_followup_input(item))
+            ),
+            len(followups),
+        )
+        if not responses_input_suffix_retains_prior_output(
+            input_items,
+            stored_count=stored_count + first_followup + first_later_response,
+            canonical_lite_developer_index=canonical_lite_developer_index,
+            fingerprint_verified_prefix=fingerprint_verified_prefix,
+        ):
+            return False
+    suffix = suffix[:first_followup]
     if not all(
         isinstance(item, dict)
         and isinstance(item.get("type"), str)
         and item.get("type") in (_TOOL_CALL_TYPES | _TOOL_CALL_TYPE_BY_OUTPUT_TYPE.keys())
         for item in suffix
     ):
+        return False
+    if any(_is_host_automation_heartbeat_input(item) for item in suffix if isinstance(item, dict)):
         return False
     if not responses_input_items_are_self_contained_fresh_replay(suffix):
         return False
@@ -471,6 +657,7 @@ def _direct_tool_call_prefix_state(
     *,
     allow_historical_developer_interleave: bool = False,
     canonical_lite_developer_index: int | None = None,
+    fingerprint_verified_prefix: bool = False,
 ) -> tuple[deque[tuple[str, str]], set[str]] | None:
     pending_calls: deque[tuple[str, str]] = deque()
     seen_call_ids: set[str] = set()
@@ -486,7 +673,21 @@ def _direct_tool_call_prefix_state(
         if item_type_value is not None and not isinstance(item_type_value, str):
             return None
         item_type = item_type_value if isinstance(item_type_value, str) else None
+        if _is_host_automation_heartbeat_input(item):
+            if pending_calls:
+                return None
+            continue
         if item.get("role") == "developer" and item_type != "additional_tools":
+            # Stored context has already been matched against the canonical stored
+            # fingerprint. Historical message IDs do not make plaintext
+            # account-bound; new suffix items still use the stricter rules.
+            # Do not weaken ordering inside an outstanding tool-call batch.
+            if fingerprint_verified_prefix and not pending_calls:
+                historical_message = {key: value for key, value in item.items() if key != "id"}
+                if (
+                    item.get("id") is None or _is_nonblank_string(item.get("id"))
+                ) and _historical_pending_developer_message_is_transparent(historical_message, item_type=item_type):
+                    continue
             developer_message_is_transparent = _historical_pending_developer_message_is_transparent(
                 item,
                 item_type=item_type,
@@ -634,6 +835,8 @@ def _is_retained_response_message(item: Mapping[str, JsonValue]) -> bool:
 
 def _is_fresh_followup_input(item: Mapping[str, JsonValue]) -> bool:
     item_type = item.get("type")
+    if item_type == "agent_message":
+        return item.get("id") in (None, "") and _agent_message_replay_rejection_reason(item) is None
     if _is_one_of(item_type, {"input_file", "input_image", "input_text"}):
         return _input_content_part_is_self_contained(item, allow_output=False)
     return (
@@ -646,6 +849,10 @@ def _is_fresh_followup_input(item: Mapping[str, JsonValue]) -> bool:
 def _tool_call_is_self_contained(item_type: str, item: Mapping[str, JsonValue]) -> bool:
     if item.get("status") not in (None, "completed"):
         return False
+    if item_type in {"function_call", "custom_tool_call"}:
+        namespace = item.get("namespace")
+        if namespace is not None and not _is_nonblank_string(namespace):
+            return False
     if item_type == "function_call":
         return _is_nonblank_string(item.get("name")) and isinstance(item.get("arguments"), str)
     if item_type == "custom_tool_call":
@@ -725,24 +932,36 @@ def _is_one_of(value: JsonValue | None, options: Container[str]) -> bool:
 
 
 def responses_payload_is_account_neutral_fresh_replay(payload: Mapping[str, JsonValue]) -> bool:
-    """Return whether a full request can move accounts without stored upstream state."""
+    """Classify portability and emit the actual decision without payload contents."""
+    reason = responses_payload_replay_rejection_reason(payload)
+    items = payload.get("input")
+    record_continuity_decision(
+        stage="payload_portability",
+        reason=reason or "accepted",
+        input_count=len(items) if isinstance(items, list) else None,
+    )
+    return reason is None
+
+
+def responses_payload_replay_rejection_reason(payload: Mapping[str, JsonValue]) -> str | None:
+    """Return the first failed portability gate, without retaining payload values."""
 
     if payload.get("conversation") not in (None, ""):
-        return False
+        return "conversation_bound"
     if payload.get("previous_response_id") not in (None, ""):
-        return False
+        return "previous_response_bound"
     if payload.get("prompt") not in (None, ""):
-        return False
+        return "prompt_bound"
     if any(key not in _RESPONSES_PAYLOAD_FIELDS_WITH_DEDICATED_VALIDATION for key in payload):
-        return False
+        return "unknown_payload_field"
     if not _reasoning_config_is_account_neutral(payload.get("reasoning")):
-        return False
+        return "reasoning_controls"
     if not _tool_choice_is_account_neutral(payload.get("tool_choice")):
-        return False
+        return "tool_choice"
     if not _text_controls_are_account_neutral(payload.get("text")):
-        return False
+        return "text_controls"
     if not _client_metadata_is_account_neutral(payload.get("client_metadata")):
-        return False
+        return "client_metadata"
 
     input_value = payload.get("input")
     if input_value is None or isinstance(input_value, str):
@@ -750,31 +969,32 @@ def responses_payload_is_account_neutral_fresh_replay(payload: Mapping[str, Json
     elif isinstance(input_value, list):
         input_items = cast(list[JsonValue], input_value)
     else:
-        return False
+        return "input_shape"
     # ``extract_input_file_ids`` tests item types by set membership; a list or
     # object in the ``type`` slot is not a replayable item and must not raise.
     if any(isinstance(item, dict) and "type" in item and not isinstance(item["type"], str) for item in input_items):
-        return False
+        return "input_shape"
     if extract_input_file_ids(input_items):
-        return False
+        return "account_owned_file"
     if any(
         isinstance(item, dict)
         and isinstance(item.get("type"), str)
-        and item.get("type") not in _ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES
+        and item.get("type") not in _CODEX_ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES
         for item in input_items
     ):
-        return False
-    if not responses_input_items_are_self_contained_fresh_replay(input_items):
-        return False
+        return "input_item_type"
+    lifecycle_rejection = responses_input_replay_rejection_reason(input_items)
+    if lifecycle_rejection is not None:
+        return lifecycle_rejection
     if not _input_items_have_valid_account_neutral_shape(input_items):
-        return False
+        return "input_content_shape"
     if _contains_account_scoped_input_state(input_items):
-        return False
+        return "account_scoped_input"
 
     tools = payload.get("tools")
     if tools is None:
-        return True
-    return _tools_are_account_neutral(tools)
+        return None
+    return None if _tools_are_account_neutral(tools) else "tool_declarations"
 
 
 def _reasoning_config_is_account_neutral(reasoning: JsonValue | None) -> bool:
@@ -784,6 +1004,7 @@ def _reasoning_config_is_account_neutral(reasoning: JsonValue | None) -> bool:
         isinstance(reasoning, dict)
         and all(key in _ACCOUNT_NEUTRAL_REASONING_CONFIG_FIELDS for key in reasoning)
         and all(value is None or isinstance(value, str) for value in reasoning.values())
+        and reasoning.get("context") in (None, "auto", "current_turn", "all_turns")
     )
 
 
@@ -842,15 +1063,29 @@ def _tools_are_account_neutral(tools: JsonValue) -> bool:
 
 def _tool_declaration_is_account_neutral(tool: Mapping[str, JsonValue]) -> bool:
     tool_type = tool.get("type")
-    if not isinstance(tool_type, str) or tool_type not in _ACCOUNT_NEUTRAL_TOOL_TYPES:
+    if not isinstance(tool_type, str) or tool_type not in _CODEX_ACCOUNT_NEUTRAL_TOOL_TYPES:
         return False
     if any(key not in _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS[tool_type] for key in tool):
         return False
-    if _contains_account_scoped_tool_state(tool):
+    # Namespace children are validated individually below. Scanning their
+    # parameter schemas here mistakes schema property names for resource IDs.
+    if tool_type != "namespace" and _contains_account_scoped_tool_state(tool):
         return False
-    if tool_type in {"custom", "function"} and not _is_nonblank_string(tool.get("name")):
+    if tool_type in {"custom", "function", "namespace"} and not _is_nonblank_string(tool.get("name")):
         return False
     if tool.get("description") is not None and not isinstance(tool.get("description"), str):
+        return False
+    if tool_type == "namespace":
+        children = tool.get("tools")
+        # Codex namespaces contain local function/custom tools, never hosted
+        # resources or nested namespaces. Validate every child normally.
+        return isinstance(children, list) and all(
+            isinstance(child, dict)
+            and child.get("type") in ("function", "custom")
+            and _tool_declaration_is_account_neutral(child)
+            for child in children
+        )
+    if tool.get("defer_loading") is not None and not isinstance(tool.get("defer_loading"), bool):
         return False
     if tool_type == "function":
         return (tool.get("parameters") is None or isinstance(tool.get("parameters"), dict)) and (
@@ -865,6 +1100,9 @@ def _web_search_tool_options_are_account_neutral(
     tool_type: str,
     tool: Mapping[str, JsonValue],
 ) -> bool:
+    for key in ("external_web_access", "indexed_web_access"):
+        if key in tool and not isinstance(tool[key], bool):
+            return False
     filters = tool.get("filters")
     if filters is not None:
         if not isinstance(filters, dict) or not set(filters) <= _ACCOUNT_NEUTRAL_WEB_SEARCH_FILTER_FIELDS:
@@ -1224,7 +1462,7 @@ def transcript_is_source_free(view: PortabilityView, *, supported_tool_types: fr
     classification_view = _classification_view(view, supported_tool_types=supported_tool_types)
     if classification_view is None or not responses_payload_is_account_neutral_fresh_replay(classification_view):
         return False
-    return not any(_item_type(item) in ("compaction", "reasoning") for item in input_items)
+    return not any(_item_type(item) in ("compaction", "reasoning", "agent_message") for item in input_items)
 
 
 def is_binding_turn_state(headers: Mapping[str, str]) -> bool:
@@ -1385,3 +1623,68 @@ def _input_carries_image_parts(input_items: list[JsonValue]) -> bool:
             if isinstance(parts, list) and any(_item_type(part) == _INPUT_IMAGE_PART_TYPE for part in parts):
                 return True
     return False
+
+
+def project_unanchored_account_neutral_input(payload: Mapping[str, JsonValue]) -> list[JsonValue] | None:
+    """Strip response-owned bookkeeping from an otherwise self-contained request."""
+
+    if payload.get("previous_response_id") not in (None, "") or payload.get("conversation") not in (None, ""):
+        return None
+    input_value = payload.get("input")
+    if not isinstance(input_value, list) or not input_value or extract_input_file_ids(input_value):
+        return None
+    last_assistant_index: int | None = None
+    for index in range(len(input_value) - 1, -1, -1):
+        item = input_value[index]
+        if isinstance(item, dict) and item.get("type") in (None, "message") and item.get("role") == "assistant":
+            last_assistant_index = index
+            break
+    if last_assistant_index is None or last_assistant_index == 0:
+        return None
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        cast(list[JsonValue], input_value),
+        stored_count=last_assistant_index,
+    )
+    if projection is None:
+        return None
+    if not responses_input_suffix_retains_prior_output(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+        canonical_lite_developer_index=projection.canonical_lite_developer_index,
+    ):
+        return None
+    projected = {**payload, "input": projection.input_items}
+    if not responses_payload_is_account_neutral_fresh_replay(projected):
+        return None
+    return projection.input_items
+
+
+def project_unanchored_plaintext_history(payload: Mapping[str, JsonValue]) -> list[JsonValue] | None:
+    """Normalize item IDs only; never reconstruct or omit client-owned history."""
+    if payload.get("previous_response_id") not in (None, "") or payload.get("conversation") not in (None, ""):
+        return None
+    items = payload.get("input")
+    if not isinstance(items, list) or not items:
+        return None
+    normalized: list[JsonValue] = []
+    user_present = False
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        item_type = item.get("type")
+        if item_type not in (
+            None,
+            "message",
+            "agent_message",
+            "additional_tools",
+            "function_call",
+            "function_call_output",
+            "custom_tool_call",
+            "custom_tool_call_output",
+        ):
+            return None
+        user_present |= item_type in (None, "message") and item.get("role") == "user"
+        normalized.append({key: value for key, value in item.items() if key != "id"})
+    if not user_present or not responses_payload_is_account_neutral_fresh_replay({**payload, "input": normalized}):
+        return None
+    return normalized

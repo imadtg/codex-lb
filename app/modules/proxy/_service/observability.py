@@ -20,12 +20,13 @@ from app.core.metrics.prometheus import (
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest, canonicalized_tools
 from app.core.types import JsonValue
 from app.core.utils.json_guards import is_json_list
-from app.core.utils.request_id import get_request_id
+from app.core.utils.request_id import get_request_id, get_request_scope_id
 from app.modules.proxy.affinity import (
     _extract_model_class,
     _prompt_cache_key_from_request_model,
     _sticky_key_from_session_header,
 )
+from app.modules.proxy.continuity_diagnostics import observed_replay_decisions
 
 logger = logging.getLogger("app.modules.proxy.service")
 
@@ -335,15 +336,21 @@ def _record_continuity_fail_closed(
         previous_response_age_seconds=previous_response_age_seconds,
         same_session=same_session,
     )
+    observed_decisions, decisions_omitted = observed_replay_decisions()
     logger.warning(
         "continuity_fail_closed surface=%s reason=%s previous_response_id=%s session_id=%s "
-        "upstream_error_code=%s diagnostics=%s",
+        "upstream_error_code=%s diagnostics=%s request=%s scope=%s "
+        "observed_replay_decisions=%s replay_decisions_omitted=%s",
         surface,
         reason,
         _hash_identifier_or_none(previous_response_id),
         _hash_identifier_or_none(session_id),
         upstream_error_code,
         diagnostics,
+        _hash_identifier_or_none(get_request_id()),
+        _hash_identifier_or_none(get_request_scope_id()),
+        observed_decisions,
+        decisions_omitted,
     )
 
 

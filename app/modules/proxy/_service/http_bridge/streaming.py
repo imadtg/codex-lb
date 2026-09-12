@@ -131,6 +131,7 @@ from app.modules.proxy._service.http_bridge.quarantine import (
     _http_bridge_session_key_poison_quarantined,
     _http_bridge_session_key_quarantined,
 )
+from app.modules.proxy._service.http_bridge.quota_recovery import quota_handoff_rejection_reason
 from app.modules.proxy._service.http_bridge.retry_circuit import (
     _HTTP_BRIDGE_RETRY_CIRCUIT_ANCHOR_ABANDONED_DETAIL,
     _http_bridge_retry_circuit_suppression_message,
@@ -261,6 +262,7 @@ from app.modules.proxy.continuity import (
     resolve_required_account_id,
     without_http_bridge_session_affinity_headers,
 )
+from app.modules.proxy.continuity_diagnostics import record_continuity_decision
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup
 from app.modules.proxy.durable_bridge_repository import durable_bridge_hash
 from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_epoch
@@ -996,6 +998,11 @@ class _HTTPBridgeStreamingMixin:
         if http_bridge_active is False:
             runtime_config = dataclasses.replace(runtime_config, enabled=False)
         request_id = ensure_request_id()
+        record_continuity_decision(
+            stage="http_ingress",
+            reason="client_anchored" if payload.previous_response_id else "client_unanchored",
+            input_count=len(payload.input) if isinstance(payload.input, list) else None,
+        )
         self._raise_for_unsupported_input_image_references(payload)
         # This dump is shared with the bridge attempt below (``bridge_payload``);
         # the size gate itself must stay here, ahead of the bridge/WS decision.
@@ -1359,6 +1366,8 @@ class _HTTPBridgeStreamingMixin:
             deferred_account_backoff_tracker.current_lifecycle = lifecycle
             return lifecycle
 
+        replay_client_input: list[JsonValue] | None = None
+
         def prepare_bridge_request(
             request_payload: ResponsesRequest,
             *,
@@ -1390,6 +1399,12 @@ class _HTTPBridgeStreamingMixin:
             request_state.deferred_account_backoff_tracker = deferred_account_backoff_tracker
             request_state.deferred_account_backoff_lifecycle = lifecycle
             request_state.durable_owner_dead = dead_owner_anchor
+            if replay_client_input is not None:
+                # Wire projection strips response IDs/bookkeeping, but the
+                # next client request still carries its original history.
+                # Publish proof of that history, as the trim path does.
+                request_state.input_item_count = len(replay_client_input)
+                request_state.input_full_fingerprint = _fingerprint_input_items(replay_client_input)
             return request_state, text_data
 
         async def release_unowned_bridge_lifecycle(
@@ -1598,6 +1613,7 @@ class _HTTPBridgeStreamingMixin:
                 replay_projection.input_items,
                 stored_count=replay_projection.stored_prefix_count,
                 canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                fingerprint_verified_prefix=True,
             ) or (
                 lookup.latest_pending_tool_calls is not None
                 and responses_input_suffix_matches_pending_tool_calls(
@@ -1605,6 +1621,7 @@ class _HTTPBridgeStreamingMixin:
                     stored_count=replay_projection.stored_prefix_count,
                     pending_tool_calls=lookup.latest_pending_tool_calls,
                     canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                    fingerprint_verified_prefix=True,
                 )
             )
 
@@ -1617,7 +1634,26 @@ class _HTTPBridgeStreamingMixin:
                 payload_looks_like_full_resend=payload_looks_like_full_resend,
             )
             stored_count = lookup.latest_input_item_count
+
+            def record_proof(reason: str) -> None:
+                record_continuity_decision(
+                    stage="durable_context_proof",
+                    reason=reason,
+                    input_count=len(payload.input) if isinstance(payload.input, list) else None,
+                    stored_count=stored_count,
+                    fingerprint_present=lookup.latest_input_full_fingerprint is not None,
+                    manifest_present=lookup.latest_pending_tool_calls is not None,
+                )
+
             if anchor_rejection is not None or stored_count is None or not isinstance(payload.input, list):
+                record_proof(
+                    {
+                        "payload_not_full_resend": "not_full_resend",
+                        "anchor_metadata_missing": "stored_proof_missing",
+                        "prefix_fingerprint_mismatch": "prefix_mismatch",
+                        "input_not_itemized": "input_not_list",
+                    }.get(anchor_rejection or "anchor_metadata_missing", "stored_proof_missing")
+                )
                 return None, None, False, anchor_rejection or "anchor_metadata_missing"
             replay_projection = project_responses_input_for_account_neutral_fresh_replay(
                 cast(list[JsonValue], payload.input),
@@ -1631,6 +1667,13 @@ class _HTTPBridgeStreamingMixin:
             safe_fresh_context = False
             if replay_projection is not None:
                 safe_fresh_context = replay_projection_retains_required_context(replay_projection, lookup)
+            record_proof(
+                "context_proven"
+                if safe_fresh_context
+                else "projection_rejected"
+                if replay_projection is None
+                else "retained_output_unproven"
+            )
             return stored_count, lookup.latest_input_full_fingerprint, safe_fresh_context, None
 
         if durable_lookup is not None:
@@ -1692,6 +1735,9 @@ class _HTTPBridgeStreamingMixin:
                             ),
                         )
         durable_anchor_trimmable = durable_full_resend_anchor_count is not None
+        # Transport isolation must not discard the source context used to
+        # decide whether an unavailable owner can be replaced safely.
+        durable_replay_context_lookup = durable_lookup
         durable_model_transition_lookup = (
             durable_lookup
             if durable_lookup is not None and not _http_bridge_models_compatible(durable_lookup.model, payload.model)
@@ -2113,17 +2159,17 @@ class _HTTPBridgeStreamingMixin:
                     stored_count=durable_full_resend_anchor_count,
                     preserve_developer_message_ids=True,
                 )
-                if eligibility_projection is None or durable_lookup is None:
+                if eligibility_projection is None or durable_replay_context_lookup is None:
                     # A body the projection cannot rebuild carries state that
                     # is not ours to move; a missing lookup is the pinned-owner
                     # case. They are different fixes, so keep them distinct.
                     durable_full_resend_context_rejection = (
-                        "account_scoped_input" if durable_lookup is not None else "no_durable_lookup"
+                        "account_scoped_input" if durable_replay_context_lookup is not None else "no_durable_lookup"
                     )
                     return False
                 durable_full_resend_retains_required_context_cache = replay_projection_retains_required_context(
                     eligibility_projection,
-                    durable_lookup,
+                    durable_replay_context_lookup,
                 )
             if not durable_full_resend_retains_required_context_cache:
                 durable_full_resend_context_rejection = "missing_prior_output"
@@ -2360,6 +2406,7 @@ class _HTTPBridgeStreamingMixin:
             nonlocal session_header_fallback_key
             nonlocal text_data
             nonlocal untrimmed_effective_payload
+            nonlocal replay_client_input
 
             preserve_operation_identity = preserve_operation
             prior_operation_id = request_state.operation_id if preserve_operation_identity else None
@@ -2396,6 +2443,7 @@ class _HTTPBridgeStreamingMixin:
             fresh_payload = durable_full_resend_fresh_payload
             if fresh_payload is None:
                 raise RuntimeError("account-neutral replay projection missing after eligibility check")
+            replay_client_input = cast(list[JsonValue], payload.input) if isinstance(payload.input, list) else None
             request_state, text_data = prepare_bridge_request(fresh_payload)
             if preserve_operation_identity:
                 request_state.operation_id = prior_operation_id
@@ -3367,6 +3415,25 @@ class _HTTPBridgeStreamingMixin:
             elif client_full_resend_fresh_upstream_request_text is not None:
                 request_state.fresh_upstream_request_text = client_full_resend_fresh_upstream_request_text
                 request_state.fresh_upstream_request_is_retry_safe = True
+        if (
+            request_state.fresh_upstream_request_is_retry_safe
+            and durable_full_resend_fresh_payload is not None
+            and durable_full_resend_is_account_neutral is True
+        ):
+            # Session-level injection/trim rebuilds request_state from raw input.
+            # Keep the already-proven projection for owner-loss retry: raw output
+            # item IDs can otherwise reject the same history that passed above.
+            _fresh_state, request_state.fresh_upstream_request_text = prepare_bridge_request(
+                durable_full_resend_fresh_payload
+            )
+            record_continuity_decision(
+                stage="retry_body",
+                reason="verified_projection_retained",
+                input_count=len(durable_full_resend_fresh_payload.input)
+                if isinstance(durable_full_resend_fresh_payload.input, list)
+                else None,
+            )
+
         initial_handoff_session = session
         initial_handoff_scope_id = ensure_request_scope_id() if original_request_unanchored else None
         if initial_handoff_scope_id is not None:
@@ -3524,6 +3591,7 @@ class _HTTPBridgeStreamingMixin:
                 return
             async with session.pending_lock:
                 request_was_enqueued = request_state in session.pending_requests
+                other_requests_pending = any(pending is not request_state for pending in session.pending_requests)
             if _http_bridge_can_replace_retired_gate_session(
                 exc,
                 session=session,
@@ -3771,6 +3839,21 @@ class _HTTPBridgeStreamingMixin:
             verified_stale_anchor_operation_fenced = _http_bridge_verified_stale_anchor_replay_is_operation_fenced(
                 session, request_state
             )
+            quota_code, _quota_message = _proxy_error_code_message(exc)
+            quota_decline_reason = quota_handoff_rejection_reason(
+                request_state,
+                quota_code,
+                operation_fenced=verified_stale_anchor_operation_fenced,
+                other_requests_pending=other_requests_pending,
+                file_bound=file_required_preferred_account,
+                context_proven=durable_full_resend_allows_account_neutral_replay,
+            )
+            quota_rejected_full_resend = quota_decline_reason is None
+            if quota_decline_reason != "not_explicit_quota":
+                record_continuity_decision(
+                    stage="quota_handoff",
+                    reason=quota_decline_reason or "fenced_replay_eligible",
+                )
             is_context_overflow = _http_bridge_is_context_overflow_error(exc)
             should_rollover_after_context_overflow = _http_bridge_should_rollover_after_context_overflow(
                 exc,
@@ -3808,6 +3891,7 @@ class _HTTPBridgeStreamingMixin:
             )
             if (
                 not should_attempt_previous_response_recovery
+                and not quota_rejected_full_resend
                 and not should_rollover_after_context_overflow
                 and not should_attempt_context_overflow_fresh_turn_recovery
             ):
@@ -3873,7 +3957,7 @@ class _HTTPBridgeStreamingMixin:
                     error_message=_HTTP_BRIDGE_LOCAL_RESET_MESSAGE,
                 )
                 raise
-            elif previous_response_rejected_full_resend:
+            elif previous_response_rejected_full_resend or quota_rejected_full_resend:
                 await capture_verified_stale_anchor_circuit_generation(session)
                 capture_verified_stale_anchor_quarantine_generation(session)
                 await reset_previous_response_recovery_operation_spool(session, request_state)
@@ -3883,8 +3967,10 @@ class _HTTPBridgeStreamingMixin:
                     error_message=_HTTP_BRIDGE_LOCAL_RESET_MESSAGE,
                 )
                 switch_to_account_neutral_replay(
-                    event="previous_response_recover_fresh_resend",
-                    detail="outcome=stale_anchor_rejected_account_neutral_replay",
+                    event="quota_recover_fresh_resend"
+                    if quota_rejected_full_resend
+                    else "previous_response_recover_fresh_resend",
+                    detail="outcome=explicit_rejection_account_neutral_replay",
                     preserve_operation=True,
                 )
                 recovery_path = "local_previous_response_fresh_replay"

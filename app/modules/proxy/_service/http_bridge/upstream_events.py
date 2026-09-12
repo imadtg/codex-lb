@@ -94,6 +94,7 @@ from app.modules.proxy._service.http_bridge.quarantine import (
     _record_http_bridge_quarantine_eventless_timeout,
     _record_http_bridge_quarantine_wedged_pending,
 )
+from app.modules.proxy._service.http_bridge.quota_recovery import quota_attempt_rejection_reason
 from app.modules.proxy._service.http_bridge.retry_circuit import (
     _HTTP_BRIDGE_RETRY_CIRCUIT_ANCHOR_ABANDONED_DETAIL,
     _POISON_ANCHOR_CAPTURE_UNAVAILABLE,
@@ -217,6 +218,7 @@ from app.modules.proxy.affinity import (
     _extract_model_class,
 )
 from app.modules.proxy.continuity import is_http_bridge_account_neutral_replay
+from app.modules.proxy.continuity_diagnostics import record_terminal_observation
 from app.modules.proxy.helpers import (
     _normalize_error_code,
     is_upstream_model_capacity_error,
@@ -1326,6 +1328,7 @@ async def _abandon_durable_http_bridge_continuity(
             owner_epoch=session.durable_owner_epoch,
             account_id=session.account.id,
             clear_continuity=True,
+            preserve_replay_proof=True,
             **rebind_fence_kwargs,
         )
     except Exception:
@@ -3404,6 +3407,7 @@ class _HTTPBridgeUpstreamEventsMixin:
             event_type=event_type,
             payload=payload,
         )
+        durable_quota_recovery = quota_attempt_rejection_reason(status_request_state, owner_pinned_quota_error) is None
         retry_error_message = _websocket_event_error_message(event_type, payload)
         # An accepted anchored request waits only when the pre-created retry
         # can actually re-send it (proxy-injected anchor); a client-supplied
@@ -3552,6 +3556,9 @@ class _HTTPBridgeUpstreamEventsMixin:
                 status_request_state is not None
                 and status_request_state.previous_response_id is not None
                 and status_request_state.preferred_account_id is not None
+                # Durable operations recover in the outer stream through the
+                # fenced rebind path; an in-place retry cannot move their owner.
+                and not durable_quota_recovery
             ):
                 safe_request_text = _prepare_websocket_request_state_for_account_switch(status_request_state)
                 if safe_request_text is not None:
@@ -4081,11 +4088,24 @@ class _HTTPBridgeUpstreamEventsMixin:
                 session.last_completed_input_prefix_fingerprint = terminal_request_state.input_full_fingerprint
 
         normalize_error_event = (
-            terminal_request_state is None or terminal_request_state.enforce_openai_sdk_contract
-        ) and (matched_request_state is None or matched_request_state.enforce_openai_sdk_contract)
+            (terminal_request_state is None or terminal_request_state.enforce_openai_sdk_contract)
+            and (matched_request_state is None or matched_request_state.enforce_openai_sdk_contract)
+        ) or durable_quota_recovery
         settlement_payload = payload
         settlement_event = event
         settlement_event_type = event_type
+        if (
+            durable_quota_recovery
+            and status_request_state is not None
+            and status_request_state.error_http_status_override is None
+        ):
+            # Both error and response.failed can conclusively reject the
+            # pre-created operation. Admission must not depend on whether the
+            # upstream included a numeric HTTP status in its WS envelope.
+            quota_status = _http_error_status_from_payload(payload)
+            status_request_state.error_http_status_override = (
+                quota_status if quota_status is not None and quota_status >= 400 else 429
+            )
         if event_type == "error" and normalize_error_event:
             http_status = _http_error_status_from_payload(payload)
             if status_request_state is not None and status_request_state.error_http_status_override is None:
@@ -4186,6 +4206,18 @@ class _HTTPBridgeUpstreamEventsMixin:
         if event_type == "response.created" and release_create_gate and created_request_state is not None:
             await _release_websocket_response_create_gate(
                 created_request_state, session.response_create_gate, scheduler=scheduler
+            )
+
+        if terminal_request_state is not None:
+            record_terminal_observation(
+                request_id=terminal_request_state.request_id,
+                archive_request_id=terminal_request_state.archive_request_id,
+                session_id=terminal_request_state.session_id,
+                account_id=session.account.id,
+                event_type=settlement_event_type,
+                response_events=terminal_request_state.response_event_count,
+                replay_count=terminal_request_state.replay_count,
+                downstream_visible=terminal_request_state.downstream_visible,
             )
 
         if terminal_request_state is not None and settlement_event_type in {"response.failed", "error"}:

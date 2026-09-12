@@ -475,6 +475,7 @@ class DurableBridgeSessionCoordinator:
         owner_epoch: int,
         account_id: str,
         clear_continuity: bool = False,
+        preserve_replay_proof: bool = False,
         expected_latest_response_id: object = REBIND_ANCHOR_UNFENCED,
         expected_latest_turn_state: object = REBIND_ANCHOR_UNFENCED,
     ) -> bool:
@@ -486,6 +487,7 @@ class DurableBridgeSessionCoordinator:
                 owner_epoch=owner_epoch,
                 account_id=account_id,
                 clear_continuity=clear_continuity,
+                preserve_replay_proof=preserve_replay_proof,
                 expected_latest_response_id=expected_latest_response_id,
                 expected_latest_turn_state=expected_latest_turn_state,
             )

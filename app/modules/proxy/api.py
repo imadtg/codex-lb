@@ -255,7 +255,7 @@ from app.modules.model_sources.selection import (
 from app.modules.proxy import affinity as proxy_affinity_module
 from app.modules.proxy import images_service as images_service_module
 from app.modules.proxy import service as proxy_service_module
-from app.modules.proxy._service.observability import record_http_bridge_routing
+from app.modules.proxy._service.observability import _record_continuity_fail_closed, record_http_bridge_routing
 from app.modules.proxy._service.support import (
     _bind_propagated_capacity_startup_ready,
     _bind_propagated_capacity_startup_wait,
@@ -276,6 +276,7 @@ from app.modules.proxy._service.support import (
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
 from app.modules.proxy.capability_routing import required_capability_metadata_values
+from app.modules.proxy.continuity_diagnostics import initialize_replay_observations
 from app.modules.proxy.downstream_delivery import DeliveryTracedStreamingResponse
 from app.modules.proxy.helpers import _openai_error_param, _parse_openai_error, _rate_limit_details
 from app.modules.proxy.http_bridge_forwarding import (
@@ -7663,6 +7664,7 @@ def _create_first_stream_probe_task(
     would log it. The done-callback retrieves the result in that abandoned case
     without hiding the error from consumers that do await the task.
     """
+    initialize_replay_observations()
     task = scheduler.create_task(_read_first_stream_item(stream))
     task.add_done_callback(_retrieve_first_stream_task_exception)
     return task
@@ -8567,6 +8569,13 @@ def _logged_error_json_response(
         )
     if status_code == 429 and is_local_overload_error_code(code):
         effective_headers = merge_retry_after_headers(effective_headers)
+    if code == "previous_response_owner_unavailable":
+        _record_continuity_fail_closed(
+            surface="http_error_response",
+            reason="owner_account_unavailable",
+            previous_response_id=None,
+            upstream_error_code=code,
+        )
     log_error_response(
         logger,
         request,

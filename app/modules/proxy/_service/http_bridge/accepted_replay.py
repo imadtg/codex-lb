@@ -32,6 +32,7 @@ from app.modules.proxy._service.support import (
     _WebSocketRequestState,
 )
 from app.modules.proxy.helpers import is_upstream_model_capacity_error
+from app.modules.proxy.replay_sequence import ReplaySequence
 
 logger = logging.getLogger("app.modules.proxy.service")
 
@@ -72,16 +73,16 @@ def _websocket_accepted_replay_candidate(
     anchored body is re-sent to the owner that accepted it, which the terminal
     proved produced nothing.
 
-    The sequence guard is the direct websocket surface's existing contract
-    (openspec: "Direct WebSocket replay never mixes numeric response
-    sequences"): a fresh upstream generation restarts its counter, so once a
-    sequenced prelude frame reached the client the terminal is finalized and
-    surfaced unchanged instead of being replayed. The HTTP bridge never
-    records a downstream watermark, so its behaviour is unaffected.
+    A sequenced lifecycle is eligible only when its visible watermark matches
+    its output-free prelude. Staging installs an explicit replacement sequence
+    mapping; the relay validates raw upstream progress independently.
     """
     if has_other_pending_requests:
         return False
-    if request_state.last_downstream_sequence_number is not None:
+    if (
+        request_state.last_downstream_sequence_number is not None
+        and request_state.last_downstream_sequence_number != request_state.response_event_count - 1
+    ):
         return False
     if not _websocket_request_is_accepted_lifecycle_only(request_state):
         return False
@@ -311,6 +312,8 @@ async def _stage_websocket_request_state_for_replay(
     if accepted:
         if create_gate is not None and not await _claim_websocket_replay_create_gate(request_state, create_gate):
             return False
+        if surface == "websocket" and request_state.last_downstream_sequence_number is not None:
+            request_state.replay_sequence = ReplaySequence(request_state.last_downstream_sequence_number)
         request_state.replay_downstream_response_id = (
             request_state.replay_downstream_response_id or request_state.response_id
         )

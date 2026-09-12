@@ -42,6 +42,7 @@ from app.modules.proxy.continuity import (
     HTTP_BRIDGE_ACCOUNT_NEUTRAL_REPLAY_REBINDABLE_KINDS,
     is_http_bridge_account_neutral_replay,
 )
+from app.modules.proxy.continuity_diagnostics import record_proof_mutation
 from app.modules.proxy.durable_bridge_transcript_codec import (
     DURABLE_BRIDGE_TRANSCRIPT_MAX_EVENTS,
     DurableBridgeTranscriptDecodeError,
@@ -151,13 +152,20 @@ def _encode_pending_tool_calls(response_id: str, value: Mapping[str, str] | None
 
 
 def _decode_pending_tool_calls(response_id: str | None, value: str | None) -> dict[str, str] | None:
-    if response_id is None or value is None:
+    if value is None:
         return None
     try:
         payload = json.loads(value)
     except (TypeError, ValueError):
         return None
-    if not isinstance(payload, dict) or payload.get("response_id") != response_id:
+    if not isinstance(payload, dict):
+        return None
+    recorded_response_id = payload.get("response_id")
+    if not isinstance(recorded_response_id, str) or not recorded_response_id.strip():
+        return None
+    # Anchor retirement retains completed replay evidence. A different live
+    # anchor must still never inherit its predecessor's tool manifest.
+    if response_id is not None and recorded_response_id != response_id:
         return None
     calls = payload.get("calls")
     if not isinstance(calls, dict):
@@ -1357,6 +1365,7 @@ class DurableBridgeRepository:
         owner_epoch: int,
         account_id: str,
         clear_continuity: bool = False,
+        preserve_replay_proof: bool = False,
         expected_latest_response_id: object = REBIND_ANCHOR_UNFENCED,
         expected_latest_turn_state: object = REBIND_ANCHOR_UNFENCED,
     ) -> bool:
@@ -1370,6 +1379,8 @@ class DurableBridgeRepository:
         never proved dead.
         """
 
+        if preserve_replay_proof and not clear_continuity:
+            raise ValueError("Replay proof retention requires anchor abandonment")
         async with sqlite_writer_section():
             values: dict[str, object] = {"account_id": account_id}
             conditions = [
@@ -1381,10 +1392,13 @@ class DurableBridgeRepository:
                 values.update(
                     latest_turn_state=None,
                     latest_response_id=None,
-                    latest_input_item_count=None,
-                    latest_input_full_fingerprint=None,
-                    latest_pending_tool_calls_json=None,
                 )
+                if not preserve_replay_proof:
+                    values.update(
+                        latest_input_item_count=None,
+                        latest_input_full_fingerprint=None,
+                        latest_pending_tool_calls_json=None,
+                    )
                 if expected_latest_response_id is not REBIND_ANCHOR_UNFENCED:
                     if expected_latest_response_id is None:
                         conditions.append(HttpBridgeSessionRecord.latest_response_id.is_(None))
@@ -1399,7 +1413,15 @@ class DurableBridgeRepository:
             if clear_continuity and bool(getattr(result, "rowcount", 0)):
                 await self._clear_aliases_for_session(session_id)
             await self._session.commit()
-        return bool(getattr(result, "rowcount", 0))
+        applied = bool(getattr(result, "rowcount", 0))
+        record_proof_mutation(
+            action="rebind_session_account",
+            session_id=session_id,
+            owner_epoch=owner_epoch,
+            applied=applied,
+            proof_preserved=preserve_replay_proof or not clear_continuity,
+        )
+        return applied
 
     async def release_session(
         self,
@@ -1438,8 +1460,8 @@ class DurableBridgeRepository:
     ) -> DurableBridgeSessionSnapshot | None:
         """Invalidate a stuck eventless anchor with a single fenced UPDATE.
 
-        Clears only the response-id anchor and the state bound to it
-        (input fingerprint/count, pending tool-call manifest). Leaves
+        Retains the completed input proof and pending tool manifest: retiring
+        an anchor does not invalidate evidence for a later full resend. Leaves
         ``latest_turn_state`` and aliases untouched so the durable session
         remains reattachable without the stale anchor. Fenced-out callers
         mutate nothing and receive the current owner snapshot.
@@ -1447,9 +1469,6 @@ class DurableBridgeRepository:
 
         values: dict[str, object] = {
             "latest_response_id": None,
-            "latest_input_item_count": None,
-            "latest_input_full_fingerprint": None,
-            "latest_pending_tool_calls_json": None,
         }
         return await self._execute_fenced_session_update(
             session_id=session_id,
@@ -1476,9 +1495,6 @@ class DurableBridgeRepository:
 
         values: dict[str, object] = {
             "latest_response_id": None,
-            "latest_input_item_count": None,
-            "latest_input_full_fingerprint": None,
-            "latest_pending_tool_calls_json": None,
         }
         async with sqlite_writer_section():
             cleared = await self._session.execute(
@@ -1495,6 +1511,13 @@ class DurableBridgeRepository:
             )
             if cleared.scalar_one_or_none() is None:
                 await self._session.rollback()
+                record_proof_mutation(
+                    action="deny_response_anchor",
+                    session_id=session_id,
+                    owner_epoch=owner_epoch,
+                    applied=False,
+                    proof_preserved=True,
+                )
                 return None
             await self._session.execute(
                 delete(HttpBridgeSessionAlias).where(
@@ -1511,6 +1534,13 @@ class DurableBridgeRepository:
                 populate_existing=True,
             )
             await self._session.commit()
+        record_proof_mutation(
+            action="deny_response_anchor",
+            session_id=session_id,
+            owner_epoch=owner_epoch,
+            applied=True,
+            proof_preserved=True,
+        )
         return _to_snapshot(row)
 
     async def record_recovery_attempt(
@@ -3244,6 +3274,14 @@ class DurableBridgeRepository:
             )
             updated_row = result.one_or_none()
             await self._session.commit()
+        if values == {"latest_response_id": None}:
+            record_proof_mutation(
+                action="retire_response_anchor",
+                session_id=session_id,
+                owner_epoch=owner_epoch,
+                applied=updated_row is not None,
+                proof_preserved=True,
+            )
         if updated_row is not None:
             return _returned_row_to_snapshot(updated_row)
         current = await self._session.get(HttpBridgeSessionRecord, session_id, populate_existing=True)
