@@ -3,7 +3,9 @@
 ## Purpose
 
 Define Responses API compatibility contracts so Codex, OpenCode, and OpenAI-style clients preserve expected behavior.
+
 ## Requirements
+
 ### Requirement: Exhausted selection preserves definitive quota rejection
 When a pre-created retry follows an explicit quota rejection and account selection fails with `no_accounts` before a replacement dispatch, the HTTP bridge SHALL preserve the provider's quota terminal instead of synthesizing a transport-incomplete failure. This SHALL NOT permit unproven history to cross accounts or suppress an ambiguous transport failure.
 
@@ -45,6 +47,7 @@ Continuity failures SHALL include bounded content-free proof and retry evidence 
 #### Scenario: A child startup task observes a rejection
 - **WHEN** the parent returns an owner-unavailable error after a startup child observed a proof refusal
 - **THEN** the final failure retains scoped reason evidence without raw input, account credentials, or opaque identifiers
+
 ### Requirement: Use prompt_cache_key as OpenAI cache affinity
 For OpenAI-style `/v1/responses`, `/v1/responses/compact`, and chat-completions requests mapped onto Responses, the service MUST treat a non-empty `prompt_cache_key` as the bounded upstream account affinity key for prompt-cache correctness even when a `session_id` header is present. OpenAI-style route wiring MUST NOT upgrade those requests to durable `CODEX_SESSION` affinity by default. This affinity MUST apply even when dashboard `sticky_threads_enabled` is disabled, the service MUST continue forwarding the same `prompt_cache_key` upstream unchanged, and the stored affinity MUST expire after the configured freshness window so older keys can rebalance. The freshness window MUST come from dashboard settings so operators can adjust it without restart.
 
@@ -10866,3 +10869,33 @@ SDK parser failure.
 - **WHEN** the bridge settles the turn
 - **THEN** it emits one terminal `response.failed` event
 - **AND** that terminal event includes a stable `response.id`
+
+### Requirement: Hard-owner selection recovery is bounded
+An HTTP stream whose hard-affinity owner is unavailable SHALL allow one brief
+selection recovery wait and reselect before surfacing the existing selection
+failure. Continued hard-owner unavailability SHALL NOT repeatedly replenish that
+wait until the overall inference budget expires. The rule SHALL be independent
+of a recent WebSocket transport failure. A recovering owner SHALL remain eligible;
+an alternate account SHALL NOT receive account-bound input.
+
+#### Scenario: Unavailable hard owner
+- **WHEN** required hard-affinity selection remains unavailable after its brief recovery wait
+- **THEN** the stream terminates with its existing selection error without alternate dispatch
+
+#### Scenario: Owner recovers during the wait
+- **WHEN** the owner becomes eligible during that recovery wait
+- **THEN** the next selection can dispatch on that owner
+
+### Requirement: Commentary does not obscure exact tool settlement
+Account-neutral replay proof SHALL permit a retained assistant commentary
+message immediately before an exact persisted tool-call batch. The tool calls
+and outputs SHALL still exactly match the persisted manifest. Commentary with
+opaque content and incomplete tool settlement SHALL remain ineligible.
+
+#### Scenario: Commentary precedes a settled tool batch
+- **WHEN** retained plaintext commentary precedes every persisted call and its matching output
+- **THEN** a pre-created quota rejection may hand the full account-neutral history to another eligible account
+
+#### Scenario: Commentary precedes an incomplete or opaque batch
+- **WHEN** any persisted output is missing or the commentary contains opaque content
+- **THEN** quota handoff remains unavailable

@@ -1,4 +1,7 @@
 [
+  {"id":"quota_bridge_commentary_tool","sources":["L2","C1"],"kind":"incident_reduction","expectation":"Retained assistant commentary before an exactly settled tool batch does not prevent quota handoff."},
+  {"id":"quota_bridge_commentary_tool_missing_output","sources":["D1","L2"],"kind":"adversarial_control","expectation":"Commentary cannot hide a missing result from the persisted tool-call manifest."},
+  {"id":"quota_bridge_commentary_tool_encrypted","sources":["D1","L2"],"kind":"adversarial_control","expectation":"Opaque commentary content does not qualify for account-neutral replay."},
   {"id":"quota_bridge_namespace_plain_prefix","sources":["C2","U2"],"kind":"client_contract","expectation":"Replay preserves namespaced function and matching result."},
   {"id":"quota_bridge_plain_prefix","sources":["U1","U2"],"kind":"recovery_contract","expectation":"Pre-created quota rejection uses alternate without historical metadata as a confounder."},
   {"id":"quota_bridge_agent_message_plain_prefix","sources":["L2","U2"],"kind":"incident_reduction","expectation":"Plaintext agent history remains usable without historical developer metadata."},

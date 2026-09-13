@@ -526,6 +526,7 @@ class _StreamingRetryMixin:
         excluded_account_ids: set[str] = set()
         transient_failed_account_id: str | None = None
         hard_affinity_same_owner_retry_attempted = False
+        hard_owner_recovery_waited = False
         # Owner-bound burst 429 same-account retries; reset when the counter's
         # account differs from the one being retried (see the closures below).
         burst_same_account_retries = 0
@@ -1643,21 +1644,19 @@ class _StreamingRetryMixin:
                         )
                     ):
                         recovery_sleep_seconds = _account_selection_recovery_sleep_seconds(selection)
-                        if (
-                            recovery_sleep_seconds is not None
-                            and selection.error_code == "hard_affinity_saturated"
-                            and upstream_websocket_transport_recently_failed()
-                        ):
-                            # A process restart arms this marker after the
-                            # previous websocket generation is gone. A hard
-                            # owner cannot recover by waiting for capacity;
-                            # surface the restart boundary promptly instead of
-                            # retaining a multi-hour capacity waiter.
-                            _facade().logger.info(
-                                "Ending hard-owner capacity wait after recent websocket restart request_id=%s",
-                                request_id,
-                            )
-                            recovery_sleep_seconds = None
+                        if selection.error_code == "hard_affinity_saturated" and recovery_sleep_seconds is not None:
+                            # This is a short owner-recovery window, not the
+                            # inference budget. Repeated selection misses cannot
+                            # replenish it, regardless of transport fallback.
+                            if hard_owner_recovery_waited:
+                                _facade().logger.info(
+                                    "Hard-owner selection recovery exhausted request_id=%s error_code=%s",
+                                    request_id,
+                                    selection.error_code,
+                                )
+                                recovery_sleep_seconds = None
+                            else:
+                                hard_owner_recovery_waited = True
                         if recovery_sleep_seconds is not None:
                             remaining_budget_seconds = proxy._remaining_budget_seconds(deadline)
                             if remaining_budget_seconds <= 0:

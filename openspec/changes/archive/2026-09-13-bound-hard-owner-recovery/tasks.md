@@ -1,0 +1,5 @@
+- [x] Reproduce through a separate process with public APIs and provider mocks.
+- [x] Prove healthy/recovering owner controls and restart persistence behavior.
+- [x] Reproduce commentary plus tool settlement from the September 13 incident.
+- [x] Implement and validate the selection-wait and replay-proof corrections.
+- [ ] Sync specifications, commit, build and perform one final deployment.

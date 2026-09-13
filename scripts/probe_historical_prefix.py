@@ -97,6 +97,16 @@ async def run(checkout, variant, artifact):
     replacement_ambiguous = variant == "quota_bridge_replacement_ambiguous"
     healthy = variant == "quota_bridge_healthy"
     namespaced_tool = variant == "quota_bridge_namespace_plain_prefix"
+    commentary_tool = variant.startswith("quota_bridge_commentary_tool")
+    commentary = {
+        "type": "message",
+        "id": "msg_commentary",
+        "role": "assistant",
+        "phase": "commentary",
+        "content": [{"type": "output_text", "text": "I will inspect the result."}],
+    }
+    if variant.endswith("encrypted"):
+        commentary["content"].append({"type": "encrypted_content", "encrypted_content": "synthetic-opaque"})
     bridge_quota = variant.startswith("quota_bridge")
     direct_quota = variant.startswith("quota_status")
     echo_turn_state = "turn_state" in variant or replacement_exhausted
@@ -139,20 +149,36 @@ async def run(checkout, variant, artifact):
                 {"type": "response.created", "response": {"id": rid, "status": "in_progress"}},
                 {"type": "response.completed", "response": {"id": rid, "status": "completed", "output": []}},
             ]
-        return [
+        events = [
             {"type": "response.created", "response": {"id": rid, "status": "in_progress"}},
-            {"type": "response.output_item.added", "output_index": 0, "item": item},
-            {"type": "response.output_item.done", "output_index": 0, "item": item},
+        ]
+        if commentary_tool and len(calls) == 1:
+            events += [
+                {"type": "response.output_item.added", "output_index": 0, "item": commentary},
+                {"type": "response.output_item.done", "output_index": 0, "item": commentary},
+            ]
+        events += [
+            {
+                "type": "response.output_item.added",
+                "output_index": 1 if commentary_tool and len(calls) == 1 else 0,
+                "item": item,
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 1 if commentary_tool and len(calls) == 1 else 0,
+                "item": item,
+            },
             {
                 "type": "response.completed",
                 "response": {
                     "id": rid,
                     "status": "completed",
-                    "output": [item],
+                    "output": [commentary, item] if commentary_tool and len(calls) == 1 else [item],
                     "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
                 },
             },
         ]
+        return events
 
     async def upstream(request):
         account = request.headers.get("chatgpt-account-id")
@@ -517,8 +543,9 @@ async def run(checkout, variant, artifact):
                     assert initial_response is not None and initial_response["id"] == "resp_owner", report["first"]
                     if not fresh_prewarm:
                         # Replay the tool actually delivered through the public API.
-                        assert initial_response["output"][0]["call_id"] == result["call_id"]
-                        tool = initial_response["output"][0]
+                        delivered = next(item for item in initial_response["output"] if item.get("call_id"))
+                        assert delivered["call_id"] == result["call_id"]
+                        tool = delivered
                     report["phase"] = "scenario"
                     if bridge_quota:
                         assert len(calls) == 1 and calls[0]["transport"] == "websocket", calls
@@ -532,6 +559,8 @@ async def run(checkout, variant, artifact):
                     if not direct_quota and not bridge_quota and not fresh_prewarm:
                         await api("POST", f"/api/accounts/{owner}/pause")
                     full: list[dict[str, Any]] = [*prefix, tool, result, {"role": "user", "content": "Continue"}]
+                    if commentary_tool:
+                        full.insert(len(prefix), commentary)
                     if fresh_prewarm:
                         full = [*prefix, {"role": "user", "content": "First real task"}]
                     if "suffix_agent" in variant:
@@ -740,6 +769,9 @@ if __name__ == "__main__":
         "--variant",
         choices=[
             "quota_bridge_namespace_plain_prefix",
+            "quota_bridge_commentary_tool",
+            "quota_bridge_commentary_tool_missing_output",
+            "quota_bridge_commentary_tool_encrypted",
             "quota_bridge_visible_failure",
             "quota_bridge_plain_prefix",
             "quota_bridge_agent_message_plain_prefix",

@@ -628,6 +628,21 @@ def responses_input_suffix_matches_pending_tool_calls(
         ):
             return False
     suffix = suffix[:first_followup]
+    # Codex may retain an assistant commentary message immediately before the
+    # persisted tool-call batch.  It is safe only when it is an ordinary,
+    # non-final commentary message with no tool identity or opaque metadata;
+    # the exact call/output manifest below remains mandatory.
+    suffix = [
+        item
+        for item in suffix
+        if not (
+            isinstance(item, dict)
+            and item.get("type") == "message"
+            and item.get("role") == "assistant"
+            and item.get("phase") == "commentary"
+            and _is_retained_response_message(item)
+        )
+    ]
     if not all(
         isinstance(item, dict)
         and isinstance(item.get("type"), str)

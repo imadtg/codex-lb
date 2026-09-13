@@ -1409,6 +1409,60 @@ def test_full_resend_exact_manifest_accepts_canonical_lite_prefix_developer_with
     )
 
 
+def test_exact_manifest_accepts_plaintext_commentary_before_settled_tool_batch() -> None:
+    items: list[JsonValue] = [
+        {"role": "user", "content": "first question"},
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "content": [{"type": "output_text", "text": "Checking."}],
+        },
+        {"type": "custom_tool_call", "call_id": "call_1", "name": "shell", "input": "pwd"},
+        {"type": "custom_tool_call_output", "call_id": "call_1", "output": "/workspace"},
+        {"role": "user", "content": "continue"},
+    ]
+
+    assert responses_input_suffix_matches_pending_tool_calls(
+        items,
+        stored_count=1,
+        pending_tool_calls={"call_1": "custom_tool_call"},
+    )
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        [
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "encrypted_content", "encrypted_content": "opaque"}],
+            },
+            {"type": "custom_tool_call", "call_id": "call_1", "name": "shell", "input": "pwd"},
+            {"type": "custom_tool_call_output", "call_id": "call_1", "output": "/workspace"},
+        ],
+        [
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "Checking."}],
+            },
+            {"type": "custom_tool_call", "call_id": "call_1", "name": "shell", "input": "pwd"},
+        ],
+    ],
+    ids=["opaque-commentary", "missing-output"],
+)
+def test_exact_manifest_commentary_keeps_replay_safety_boundaries(suffix: list[JsonValue]) -> None:
+    assert not responses_input_suffix_matches_pending_tool_calls(
+        [{"role": "user", "content": "first question"}, *suffix, {"role": "user", "content": "continue"}],
+        stored_count=1,
+        pending_tool_calls={"call_1": "custom_tool_call"},
+    )
+
+
 @pytest.mark.parametrize(
     "stored_input",
     [
