@@ -56,7 +56,12 @@ from app.core.errors import (
     PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE as PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
 )
 from app.core.openai.models import OpenAIError, OpenAIEvent, OpenAIResponsePayload, ResponseUsage
-from app.core.openai.parsing import classify_event_type, parse_sse_event
+from app.core.openai.parsing import (
+    _LIFECYCLE_EVENT_TYPES,
+    classify_event_type,
+    parse_sse_event,
+    parse_sse_event_payload,
+)
 from app.core.openai.requests import ResponsesRequest
 from app.core.resilience.network_recovery import (
     PROCESS_NETWORK_UNAVAILABLE_CODE,
@@ -475,6 +480,20 @@ def _is_background_json_ack(
     event_type: str | None,
 ) -> bool:
     return stream is False and _canonical_background_ack_response_id(event_payload, event_type) is not None
+
+
+def _parse_owned_stream_frame(
+    proxy: _StreamingServiceProtocol,
+    account_id: str,
+    api_key: ApiKeyData | None,
+    session_id: str | None,
+    block: str,
+) -> tuple[dict[str, JsonValue] | None, str | None, OpenAIEvent | None]:
+    payload = parse_sse_data_json(block)
+    event_type = classify_event_type(payload)
+    event = parse_sse_event_payload(payload) if event_type in _LIFECYCLE_EVENT_TYPES else None
+    _publish_http_response_owner(proxy, event, payload, block, account_id, api_key, session_id)
+    return payload, event_type, event
 
 
 def _publish_http_response_owner(

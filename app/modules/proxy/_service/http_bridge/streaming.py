@@ -2486,6 +2486,22 @@ class _HTTPBridgeStreamingMixin:
             file_required_preferred_account = False
 
         if (
+            durable_lookup is not None
+            and durable_lookup.state != HttpBridgeSessionState.ACTIVE
+            and durable_lookup.latest_response_id is None
+            and effective_payload.previous_response_id is None
+            and durable_full_resend_allows_account_neutral_replay()
+        ):
+            # A closed predecessor with a retired anchor has no provider
+            # continuation to reattach. Plan its verified full resend through
+            # the existing recovery lane, including operation admission, rather
+            # than reopening an unanchored owner-pinned socket with no ledger.
+            switch_to_account_neutral_replay(
+                event="retired_anchor_fresh_resend",
+                detail="outcome=closed_predecessor_proof_retained",
+            )
+
+        if (
             dead_owner_anchor
             and durable_lookup is not None
             and durable_lookup.state == HttpBridgeSessionState.ACTIVE

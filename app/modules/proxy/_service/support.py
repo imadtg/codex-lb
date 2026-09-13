@@ -42,13 +42,13 @@ from app.modules.api_keys.service import (
 )
 from app.modules.proxy.affinity import _AffinityPolicy
 from app.modules.proxy.affinity_observation import AffinityObservation
+from app.modules.proxy.durable_bridge_repository import DurableBridgeAliasRegistrationReceipt
 from app.modules.proxy.helpers import _normalize_error_code, _parse_openai_error
 from app.modules.proxy.load_balancer import (
     AccountLease,
     AccountSelection,
     CatalogOmissionQuotaAdmission,
 )
-from app.modules.proxy.replay_sequence import ReplaySequence
 from app.modules.proxy.tool_call_dedupe import ToolCallDedupeKey
 from app.modules.proxy.work_admission import AdmissionLease
 
@@ -1279,8 +1279,7 @@ class _WebSocketRequestState:
     client_ip: str | None = None
     downstream_visible: bool = False
     last_downstream_sequence_number: int | None = None
-    replay_sequence: ReplaySequence | None = None
-    verified_prewarm_replay: bool = False
+    recovery_alias_receipt: DurableBridgeAliasRegistrationReceipt | None = None
     # Confirmed pre-dispatch account-route failures must not mutate account
     # health while this request's API-key reservation is still live. The
     # account objects are keyed by id so repeated connect attempts cannot
@@ -1554,10 +1553,6 @@ def _http_bridge_session_supports_service_tier(
 
 @dataclass(slots=True)
 class _WebSocketContinuityState:
-    completed_prewarm_response_id: str | None = None
-    completed_prewarm_input_count: int = 0
-    completed_prewarm_input_fingerprint: str | None = None
-    completed_prewarm_request_text: str | None = None
     last_completed_input_count: int = 0
     last_completed_response_id: str | None = None
     last_completed_input_prefix_fingerprint: str | None = None
@@ -1784,8 +1779,9 @@ def _websocket_request_is_accepted_lifecycle_only(request_state: _WebSocketReque
     This predicate describes the upstream lifecycle only. Downstream sequence
     exposure (``last_downstream_sequence_number``) is judged by the callers:
     ``_websocket_request_can_replay_before_visible_output`` and the accepted
-    capacity classifier decides whether to install an explicit replacement
-    sequence mapping. Transport-close replay keeps its stricter sequence guard.
+    capacity classifier both keep refusing a sequenced request, so the direct
+    websocket surface never replays after a finite ``sequence_number`` frame
+    was forwarded.
     """
     if request_state.response_id is None or request_state.awaiting_response_created:
         return False

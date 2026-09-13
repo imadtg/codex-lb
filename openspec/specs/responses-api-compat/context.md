@@ -8,6 +8,23 @@ See `openspec/specs/responses-api-compat/spec.md` for normative requirements.
 
 ## Rationale and Decisions
 
+The beta.8 continuity integration keeps upstream owner retirement and selection,
+while retaining a fenced handoff for explicitly rejected quota attempts with
+proven complete portable history. Completed history proof belongs to its original
+account: retiring a stale response anchor preserves that proof, but reassigning
+an account does not copy it. If replacement B rejects quota before creation, its
+provisional client alias can be rolled back to predecessor A under the captured
+epoch/account receipt; an identical proven resend can then reach eligible C.
+Accepted or ambiguous B outcomes cannot use this rollback.
+
+Plaintext agent deliveries and local namespace tools have explicit validators;
+opaque agent content and incomplete tool settlement remain ineligible. Sequenced
+prewarm capacity recovery is not extended. A mandatory-owner selection failure
+after a definitive quota rejection preserves the quota terminal rather than
+inventing a transport-incomplete error. The integration audit records provenance,
+public-process counterfactuals and unproved boundaries in the OpenSpec change
+`integrate-beta8-continuity`.
+
 - **Responses as canonical wire format:** Internally we treat Responses as the source of truth to avoid divergent streaming semantics.
 - **Strict validation:** Required fields and mutually exclusive fields are enforced up front to match official client expectations.
 - **Cursor alias compatibility:** Cursor UI model labels may append reasoning or speed suffixes to GPT-5 slugs; those are normalized to canonical upstream fields before forwarding.

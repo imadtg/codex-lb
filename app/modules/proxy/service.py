@@ -5,7 +5,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Collection
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Literal, Mapping, NoReturn, TypeVar, cast
+from typing import Any, AsyncIterator, Literal, Mapping, NoReturn, TypeVar
 
 import aiohttp
 import anyio
@@ -120,7 +120,6 @@ from app.core.openai.models import CompactResponsePayload, OpenAIResponsePayload
 from app.core.openai.requests import (
     ResponsesCompactRequest,
     ResponsesRequest,
-    strip_replayed_tool_call_namespaces_from_payload,
 )
 from app.core.resilience.network_recovery import (
     ProcessNetworkRecovery as ProcessNetworkRecovery,
@@ -451,6 +450,9 @@ from app.modules.proxy._service.response_create import (
 )
 from app.modules.proxy._service.response_create import (
     _input_part_is_image as _input_part_is_image,
+)
+from app.modules.proxy._service.response_create import (
+    _input_prefix_matches_stored_context as _input_prefix_matches_stored_context,
 )
 from app.modules.proxy._service.response_create import (
     _json_size_bytes as _json_size_bytes,
@@ -2486,29 +2488,6 @@ def _is_text_content_part(payload: dict[str, JsonValue] | None) -> bool:
         return False
     part_type = part.get("type")
     return isinstance(part_type, str) and part_type in _TEXT_DONE_CONTENT_PART_TYPES
-
-
-def _input_prefix_matches_stored_context(
-    input_value: JsonValue,
-    *,
-    stored_count: int,
-    stored_fingerprint: str | None,
-) -> bool:
-    if stored_count <= 0 or stored_fingerprint is None:
-        return False
-    if not isinstance(input_value, list):
-        return False
-    if len(input_value) <= stored_count:
-        return False
-    prefix = cast(list[JsonValue], input_value)[:stored_count]
-    if _fingerprint_input_items(prefix) == stored_fingerprint:
-        return True
-    # Prior dispatch fingerprints the forwarding representation, which strips
-    # replayed namespaces. Compare that same representation without changing
-    # the client payload or weakening checks on any other field.
-    normalized: dict[str, JsonValue] = {"input": prefix}
-    strip_replayed_tool_call_namespaces_from_payload(normalized)
-    return _fingerprint_input_items(normalized["input"]) == stored_fingerprint
 
 
 def _is_missing_thread_goal_protocol_error(exc: ProxyResponseError) -> bool:

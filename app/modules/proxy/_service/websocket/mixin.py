@@ -455,7 +455,6 @@ from app.modules.proxy._service.websocket.helpers import (
     _websocket_precreated_retry_error_code,
     _websocket_receive_timeout_for_pending_requests,
     _websocket_response_id,
-    _websocket_verified_prewarm_full_resend,
     _wrapped_websocket_error_event,
 )
 from app.modules.proxy._service.websocket.overflow import (
@@ -3247,7 +3246,6 @@ class _WebSocketMixin:
         client_full_resend_payload: ResponsesRequest | None = None
         client_full_resend_input_items: list[JsonValue] | None = None
         client_full_resend_retry_safe = False
-        verified_prewarm_full_resend = False
         if responses_payload.previous_response_id is not None and isinstance(responses_payload.input, list):
             previous_response_input_items = cast(list[JsonValue], responses_payload.input)
             client_full_resend_input_items = previous_response_input_items
@@ -3256,8 +3254,6 @@ class _WebSocketMixin:
                 input_value=responses_payload.input,
                 continuity_state=continuity_state,
             )
-            verified_prewarm_full_resend = _websocket_verified_prewarm_full_resend(responses_payload, continuity_state)
-            client_full_resend_retry_safe |= verified_prewarm_full_resend
             trimmed_input_items = _trim_websocket_previous_response_input_items(previous_response_input_items)
             if len(trimmed_input_items) != len(previous_response_input_items):
                 previous_response_trimmed_input_count = len(previous_response_input_items)
@@ -3470,16 +3466,6 @@ class _WebSocketMixin:
                     responses_payload.previous_response_id,
                     request_state.input_item_count,
                 )
-        request_state.verified_prewarm_replay = (
-            verified_prewarm_full_resend and request_state.fresh_upstream_request_is_retry_safe
-        )
-        if verified_prewarm_full_resend:
-            _facade().logger.info(
-                "prewarm_replay_proof request_id=%s verified=%s input_count=%s",
-                request_state.request_id,
-                request_state.verified_prewarm_replay,
-                request_state.input_item_count,
-            )
         affinity_policy = _sticky_key_for_responses_request(
             # Only the proven restart uses the pre-injection body. Ordinary
             # full resends must be classified after anchor injection so they
@@ -5546,8 +5532,7 @@ class _WebSocketMixin:
                 )
                 sequence_number = parsed_frame.sequence_number
                 if (
-                    request_state.replay_sequence is None
-                    and request_state.replay_downstream_response_id is not None
+                    request_state.replay_downstream_response_id is not None
                     and request_state.last_downstream_sequence_number is not None
                     and sequence_number is not None
                     and sequence_number <= request_state.last_downstream_sequence_number
@@ -5608,18 +5593,6 @@ class _WebSocketMixin:
                     request_state.suppress_next_in_progress_downstream = False
                     upstream_control.suppress_downstream_event = True
                 if payload is not None:
-                    if request_state.replay_sequence is not None:
-                        raw_sequence = payload.get("sequence_number")
-                        if not isinstance(raw_sequence, int) or isinstance(raw_sequence, bool):
-                            raise _WebSocketReplaySequenceRegression("replacement sequence missing or invalid")
-                        try:
-                            mapped_sequence = request_state.replay_sequence.advance(
-                                raw_sequence, suppressed=upstream_control.suppress_downstream_event
-                            )
-                        except ValueError as exc:
-                            raise _WebSocketReplaySequenceRegression(str(exc)) from exc
-                        payload = {**payload, "sequence_number": mapped_sequence}
-                        text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
                     rewritten_payload = _rewrite_websocket_downstream_response_id(payload, request_state)
                     if rewritten_payload is not payload:
                         payload = rewritten_payload
@@ -6090,13 +6063,6 @@ class _WebSocketMixin:
                     # the bridge's owner-bound anchored retry). The dispatch
                     # binding already requires that owner on the reconnect.
                     _prepare_websocket_request_state_for_account_switch(request_state)
-                if (
-                    accepted_lifecycle_replay
-                    and request_state.verified_prewarm_replay
-                    and request_state.previous_response_id is None
-                    and _websocket_accepted_replay_can_switch_account(request_state)
-                ):
-                    request_state.affinity_policy = _AffinityPolicy()
                 if accepted_lifecycle_replay and _websocket_accepted_replay_may_exclude_account(request_state):
                     # The accepted turn failed on this account; move the
                     # account-neutral replay to another one like the bridge does.
@@ -6142,21 +6108,6 @@ class _WebSocketMixin:
             and completed_usage is not None
             and completed_usage.output_tokens == 0
         )
-        completed_response_payload = payload.get("response") if isinstance(payload, dict) else None
-        if (
-            event_type == "response.completed"
-            and continuity_state is not None
-            and request_state.generate_false_prewarm
-            and completed_usage is not None
-            and completed_usage.output_tokens == 0
-            and isinstance(completed_response_payload, dict)
-            and completed_response_payload.get("output") == []
-            and not request_state.upstream_model_output_seen
-        ):
-            continuity_state.completed_prewarm_response_id = response_id
-            continuity_state.completed_prewarm_input_count = request_state.input_item_count
-            continuity_state.completed_prewarm_input_fingerprint = request_state.input_full_fingerprint
-            continuity_state.completed_prewarm_request_text = request_state.request_text
         if event_type == "response.completed" and continuity_state is not None and not completed_empty_prewarm:
             _record_websocket_continuity_completion(
                 continuity_state,

@@ -37,7 +37,7 @@ from app.core.clients.proxy import (
     apply_codex_installation_metadata,
 )
 from app.core.config.settings import DEFAULT_HOME_DIR, get_settings
-from app.core.openai.requests import ResponsesRequest
+from app.core.openai.requests import ResponsesRequest, strip_replayed_tool_call_namespaces_from_payload
 from app.core.types import JsonValue
 from app.core.utils.json_guards import is_json_mapping
 from app.modules.proxy._service.support import (
@@ -157,6 +157,29 @@ def _fingerprint_input_items(items: Sequence[JsonValue]) -> str:
     """Return stable SHA-256 fingerprint for input list canonical JSON."""
     canonical = json.dumps(list(items), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _input_prefix_matches_stored_context(
+    input_value: JsonValue,
+    *,
+    stored_count: int,
+    stored_fingerprint: str | None,
+) -> bool:
+    if stored_count <= 0 or stored_fingerprint is None:
+        return False
+    if not isinstance(input_value, list):
+        return False
+    if len(input_value) <= stored_count:
+        return False
+    prefix = cast(list[JsonValue], input_value)[:stored_count]
+    if _fingerprint_input_items(prefix) == stored_fingerprint:
+        return True
+    # Prior dispatch fingerprints the forwarding representation, which strips
+    # replayed namespaces. Compare that same representation without changing
+    # the client payload or weakening checks on any other field.
+    normalized: dict[str, JsonValue] = {"input": prefix}
+    strip_replayed_tool_call_namespaces_from_payload(normalized)
+    return _fingerprint_input_items(normalized["input"]) == stored_fingerprint
 
 
 def _input_part_is_image(part: JsonValue) -> bool:

@@ -694,10 +694,7 @@ def _prepare_websocket_request_state_for_account_switch(
         if not _websocket_request_text_is_account_neutral_fresh_replay(request_state.request_text):
             return None
         return request_state.request_text
-    return _install_verified_fresh_replay(
-        request_state,
-        require_proxy_injected_previous_response_id=not request_state.verified_prewarm_replay,
-    )
+    return _install_verified_fresh_replay(request_state)
 
 
 def _retire_websocket_continuity_anchor(continuity_state: _WebSocketContinuityState) -> None:
@@ -775,32 +772,6 @@ def _websocket_input_items_are_self_contained_fresh_replay(input_items: list[Jso
         if call_id is None or call_id not in seen_call_ids_by_type[call_item_type]:
             return False
     return True
-
-
-def _websocket_verified_prewarm_full_resend(
-    payload: ResponsesRequest,
-    continuity_state: _WebSocketContinuityState | None,
-) -> bool:
-    if (
-        continuity_state is None
-        or payload.previous_response_id is None
-        or payload.previous_response_id != continuity_state.completed_prewarm_response_id
-        or continuity_state.completed_prewarm_request_text is None
-        or not isinstance(payload.input, list)
-    ):
-        return False
-    prior = json.loads(continuity_state.completed_prewarm_request_text)
-    current = payload.to_replay_safety_payload()
-    # The anchor can supply instructions and tool definitions as well as input.
-    # A replay must explicitly retain these; absent values are not proof.
-    if any(prior.get(key) != current.get(key) for key in ("instructions", "tools")):
-        return False
-    count = continuity_state.completed_prewarm_input_count
-    return count == 0 or _facade()._input_prefix_matches_stored_context(
-        payload.input,
-        stored_count=count,
-        stored_fingerprint=continuity_state.completed_prewarm_input_fingerprint,
-    )
 
 
 def _websocket_client_previous_response_full_resend_is_retry_safe(

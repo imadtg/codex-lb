@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from functools import partial
 from typing import Any, AsyncIterator, Mapping, cast
 
 import aiohttp
@@ -41,11 +42,10 @@ from app.core.errors import (
     PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE as PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
 )
 from app.core.errors import synthetic_stream_failure_event as response_failed_event
-from app.core.openai.parsing import _LIFECYCLE_EVENT_TYPES, classify_event_type, parse_sse_event_payload
 from app.core.openai.requests import ResponsesRequest
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError
 from app.core.utils.sse import CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME  # noqa: F401
-from app.core.utils.sse import format_sse_event, parse_sse_data_json
+from app.core.utils.sse import format_sse_event
 from app.core.utils.time import utcnow as utcnow
 from app.db.models import (
     Account,
@@ -271,7 +271,7 @@ from app.modules.proxy._service.streaming.helpers import (
     _mark_upstream_stream_incomplete,
     _observe_terminal_stream_error_frame,
     _openai_error_fields,
-    _publish_http_response_owner,
+    _parse_owned_stream_frame,
     _rewrite_malformed_stream_error_event,
     _stamp_terminal,
     _stream_transport_failure_event_or_raise,
@@ -509,6 +509,7 @@ class _StreamingMixin(_StreamingRetryMixin):
         actual_service_tier: str | None = None
         reasoning_effort = payload.reasoning.effort if payload.reasoning else None
         session_id = _owner_lookup_session_id_from_headers(headers)
+        parse_frame = partial(_parse_owned_stream_frame, proxy, account_id_value, api_key, session_id)
         # Keep selection/failover waits out of latency and TTFT, record them as
         # queue time, then re-anchor after this attempt's admission wait.
         attempt_started_at = start = clock.monotonic()
@@ -634,10 +635,7 @@ class _StreamingMixin(_StreamingRetryMixin):
             response_create_lease.release()
             await proxy._load_balancer.release_account_lease(account_response_create_lease)
             account_response_create_lease = None
-            first_payload = parse_sse_data_json(first)
-            event_type = classify_event_type(first_payload)
-            event = parse_sse_event_payload(first_payload) if event_type in _LIFECYCLE_EVENT_TYPES else None
-            _publish_http_response_owner(proxy, event, first_payload, first, account_id_value, api_key, session_id)
+            first_payload, event_type, event = parse_frame(first)
             preserve_raw_sse_line = not enforce_openai_sdk_contract and event_type == "error"
             malformed_error_rewrite = _rewrite_malformed_stream_error_event(
                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
@@ -793,10 +791,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                     settlement.downstream_visible = True
                     yield line
                     continue
-                event_payload = parse_sse_data_json(line)
-                event_type = classify_event_type(event_payload)
-                event = parse_sse_event_payload(event_payload) if event_type in _LIFECYCLE_EVENT_TYPES else None
-                _publish_http_response_owner(proxy, event, event_payload, line, account_id_value, api_key, session_id)
+                event_payload, event_type, event = parse_frame(line)
                 preserve_raw_sse_line = not enforce_openai_sdk_contract and event_type == "error"
                 malformed_error_rewrite = _rewrite_malformed_stream_error_event(
                     enforce_openai_sdk_contract=enforce_openai_sdk_contract,

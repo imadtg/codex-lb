@@ -972,7 +972,7 @@ def _make_bridge_session(
     )
 
 
-def test_http_bridge_account_neutral_replay_rejects_namespaced_tool_call_history() -> None:
+def test_http_bridge_account_neutral_replay_accepts_settled_local_namespaced_tool_history() -> None:
     payload = proxy_service.ResponsesRequest.model_validate(
         {
             "model": "gpt-5.6-sol",
@@ -992,7 +992,7 @@ def test_http_bridge_account_neutral_replay_rejects_namespaced_tool_call_history
         }
     )
 
-    assert http_bridge_streaming_module._http_bridge_payload_is_account_neutral_fresh_replay(payload) is False
+    assert http_bridge_streaming_module._http_bridge_payload_is_account_neutral_fresh_replay(payload) is True
 
 
 def test_http_bridge_account_neutral_replay_rejects_account_scoped_file_input() -> None:
@@ -28177,7 +28177,7 @@ async def test_stream_via_http_bridge_fails_closed_before_file_affinity_when_pre
         ("missing_prior_output", False, None),
         ("orphan_output", False, None),
         ("response_owned_developer", False, None),
-        ("response_owned_stored_developer", False, None),
+        ("malformed_stored_developer", False, None),
         ("missing_owner", False, None),
     ],
 )
@@ -28211,21 +28211,21 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
             "internal_chat_message_metadata_passthrough": owner_metadata,
         },
     ]
-    if unsafe_replay_input in {"response_owned_developer", "response_owned_stored_developer"}:
+    if unsafe_replay_input in {"response_owned_developer", "malformed_stored_developer"}:
         responses_lite_tools: proxy_service.JsonValue = {
             "type": "additional_tools",
             "role": "developer",
             "tools": [{"type": "custom", "name": "shell"}],
         }
         historical_input.insert(0, responses_lite_tools)
-    if unsafe_replay_input == "response_owned_stored_developer":
-        # Immediately after the Responses-Lite bundle, so the canonical position holds and the
-        # response-owned ID is the only remaining rejection cause.
+    if unsafe_replay_input == "malformed_stored_developer":
+        # Fingerprinted historical string IDs are portable. A malformed ID must
+        # still fail even at the canonical position after a Responses-Lite bundle.
         historical_input.insert(
             1,
             {
                 "type": "message",
-                "id": "msg_stored_response_owned",
+                "id": 7,
                 "role": "developer",
                 "internal_chat_message_metadata_passthrough": owner_metadata,
                 "content": [{"type": "input_text", "text": "stored response-owned control"}],
@@ -28430,6 +28430,11 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
     )
     monkeypatch.setattr(http_bridge_streaming_module, "_ACCOUNT_SELECTION_RECOVERY_HEARTBEAT_SECONDS", 0.001)
     monkeypatch.setattr(service._durable_bridge, "lookup_request_targets", AsyncMock(return_value=durable_lookup))
+    # This matrix tests replay proof with an owner that can return within
+    # the request budget. Owner retirement has separate repository coverage.
+    monkeypatch.setattr(
+        service._durable_bridge, "retire_continuity_owner_if_unavailable", AsyncMock(return_value=False)
+    )
     monkeypatch.setattr(service, "_http_bridge_has_live_local_session", AsyncMock(return_value=False))
     monkeypatch.setattr(service, "_http_bridge_can_forward_to_active_owner", AsyncMock(return_value=False))
     monkeypatch.setattr(service, "_resolve_file_account_for_responses", AsyncMock(return_value=None))
@@ -28475,7 +28480,7 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
             "missing_prior_output",
             "orphan_output",
             "response_owned_developer",
-            "response_owned_stored_developer",
+            "malformed_stored_developer",
         }:
             account_neutral_classifier.assert_not_called()
         else:
@@ -34165,6 +34170,7 @@ async def test_http_bridge_repeated_zero_event_idle_timeouts_poison_anchor_with_
         owner_epoch=3,
         account_id="acc-bridge",
         clear_continuity=True,
+        preserve_replay_proof=True,
         expected_latest_response_id="resp_poisoned_anchor",
         expected_latest_turn_state=None,
     )
@@ -34221,6 +34227,7 @@ async def test_http_bridge_repeated_zero_event_stream_incompletes_poison_anchor_
         owner_epoch=3,
         account_id="acc-bridge",
         clear_continuity=True,
+        preserve_replay_proof=True,
         expected_latest_response_id="resp_poisoned_anchor",
         expected_latest_turn_state=None,
     )
@@ -34407,6 +34414,7 @@ async def test_http_bridge_retire_stale_pending_poisons_anchor_after_repeated_ev
             "owner_epoch": 5,
             "account_id": "acc-bridge",
             "clear_continuity": True,
+            "preserve_replay_proof": True,
             "expected_latest_response_id": "resp_poisoned_anchor",
             "expected_latest_turn_state": None,
         }
@@ -34615,7 +34623,7 @@ async def test_stream_via_http_bridge_recovers_terse_previous_response_rejection
 async def test_stream_via_http_bridge_same_owner_fresh_replay_pins_owner_without_continuity_provenance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A session-injected anchor must not let the fresh replay switch accounts."""
+    """An account-owned tool resource must keep the full resend on its owner."""
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     prefix = {"role": "user", "content": [{"type": "input_text", "text": "first"}]}
     full_input = [
@@ -34646,6 +34654,7 @@ async def test_stream_via_http_bridge_same_owner_fresh_replay_pins_owner_without
             "model": "gpt-5.4",
             "instructions": "hi",
             "input": full_input,
+            "tools": [{"type": "file_search", "vector_store_ids": ["vs_owner"]}],
         }
     )
     lookup = proxy_service.DurableBridgeLookup(
@@ -34896,6 +34905,7 @@ async def test_http_bridge_anchor_poisoning_waits_when_durable_clear_fails(
         owner_epoch=4,
         account_id="acc-bridge",
         clear_continuity=True,
+        preserve_replay_proof=True,
         expected_latest_response_id="resp_poisoned_anchor",
         expected_latest_turn_state=None,
     )

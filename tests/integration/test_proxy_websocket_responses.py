@@ -13692,23 +13692,37 @@ def _sequenced_accepted_capacity_failure_upstream(response_id: str) -> _Sequence
     )
 
 
-def test_backend_responses_websocket_sequenced_capacity_replay_rejects_unsequenced_replacement(
+def test_backend_responses_websocket_sequenced_accepted_capacity_error_is_not_replayed(
     app_instance,
     monkeypatch,
 ):
-    """A replacement must supply valid sequence evidence before output is forwarded."""
+    """#2127 round 4 P2-B: native Codex frames carry ``sequence_number``. Once
+    created(0) and in_progress(1) reached the client, the existing requirement
+    "Direct WebSocket replay never mixes numeric response sequences" (scenario
+    "Sequenced retryable terminal event is not replayed") governs: the
+    accepted capacity terminal is finalized and surfaced unchanged on the
+    single connect, exactly as on ``main``; the accepted-lifecycle replay does
+    not widen that contract."""
     first_upstream = _sequenced_accepted_capacity_failure_upstream("resp_ws_seq_accepted_failed")
     recovered_upstream = _recovered_upstream("resp_ws_seq_accepted_unused")
     failover = _TwoAccountWebSocketFailover(first_upstream, recovered_upstream)
     failover.install(monkeypatch)
+
     events, disconnect = failover.run(app_instance)
-    assert disconnect is not None and disconnect.code == 1011
+
+    assert disconnect is None, f"unexpected disconnect code={disconnect.code}"
     assert [(event["type"], event["sequence_number"]) for event in events] == [
         ("response.created", 0),
         ("response.in_progress", 1),
+        ("error", 2),
     ]
-    assert failover.connect_accounts == [failover.FIRST_ACCOUNT_ID, failover.SECOND_ACCOUNT_ID]
-    assert len(recovered_upstream.sent_text) == 1
+    assert events[0]["response"]["id"] == "resp_ws_seq_accepted_failed"
+    assert events[-1]["error"]["code"] == "server_is_overloaded"
+    assert failover.connect_accounts == [failover.FIRST_ACCOUNT_ID]
+    assert failover.excluded_at_connect == [set()]
+    assert not failover.refused_connects
+    assert len(first_upstream.sent_text) == 1
+    assert recovered_upstream.sent_text == []
 
 
 def test_backend_responses_websocket_sequenced_accepted_abrupt_close_fails_closed_without_replay(

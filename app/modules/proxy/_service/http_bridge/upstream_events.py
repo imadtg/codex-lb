@@ -81,6 +81,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_request_counts_against_queue,
     _http_bridge_request_state_holds_safe_replay,
     _http_bridge_retry_circuit_attempt_selection_for_pending_requests,
+    _http_bridge_turn_state_alias_key,
     _log_http_bridge_event,
     _normalize_http_bridge_error_event,
     _record_http_bridge_denied_anchor_fence,
@@ -94,7 +95,10 @@ from app.modules.proxy._service.http_bridge.quarantine import (
     _record_http_bridge_quarantine_eventless_timeout,
     _record_http_bridge_quarantine_wedged_pending,
 )
-from app.modules.proxy._service.http_bridge.quota_recovery import quota_attempt_rejection_reason
+from app.modules.proxy._service.http_bridge.quota_recovery import (
+    is_precreated_quota_rejection,
+    quota_attempt_rejection_reason,
+)
 from app.modules.proxy._service.http_bridge.retry_circuit import (
     _HTTP_BRIDGE_RETRY_CIRCUIT_ANCHOR_ABANDONED_DETAIL,
     _POISON_ANCHOR_CAPTURE_UNAVAILABLE,
@@ -1266,6 +1270,49 @@ async def _clear_durable_http_bridge_response_anchor(
         cache_key_family=session.key.affinity_kind,
         model_class=_extract_model_class(session.request_model) if session.request_model else None,
     )
+
+
+async def _rollback_quota_rejected_recovery_alias(
+    service: Any,
+    session: "_HTTPBridgeSession",
+    request_state: "_WebSocketRequestState",
+) -> None:
+    """Undo provisional routing, never copy provider-owned completion proof."""
+    receipt = request_state.recovery_alias_receipt
+    if receipt is None:
+        return
+    async with session.lifecycle_lock:
+        async with session.recovery_alias_lock:
+            async with session.pending_lock:
+                if any(pending is not request_state for pending in session.pending_requests):
+                    return
+            rollback_task = scheduler_for(service).create_task(
+                service._durable_bridge.rollback_recovery_turn_state_registration(receipt=receipt)
+            )
+            rolled_back, cancellation = await _await_task_deferring_cancellation(rollback_task)
+            if rolled_back:
+                # Drop only this lane's publication. The restored durable alias
+                # resolves the predecessor on the next lookup; do not resurrect
+                # its socket or overwrite a newer local registration.
+                async with service._http_bridge_lock:
+                    alias = receipt.alias_value
+                    alias_key = _http_bridge_turn_state_alias_key(alias, session.key.api_key_id)
+                    if service._http_bridge_turn_state_index.get(alias_key) == session.key:
+                        service._http_bridge_turn_state_index.pop(alias_key, None)
+                    session.downstream_turn_state_aliases.discard(alias)
+                    session.turn_state_alias_registration_generations.pop(alias, None)
+                    if session.downstream_turn_state == alias:
+                        session.downstream_turn_state = None
+                request_state.recovery_alias_receipt = None
+            _log_http_bridge_event(
+                "recovery_alias_rollback",
+                session.key,
+                account_id=session.account.id,
+                model=request_state.model,
+                detail="quota_rejected_restored" if rolled_back else "owner_fenced",
+            )
+            if cancellation is not None:
+                raise cancellation
 
 
 async def _abandon_durable_http_bridge_continuity(
@@ -3409,6 +3456,9 @@ class _HTTPBridgeUpstreamEventsMixin:
         )
         durable_quota_recovery = quota_attempt_rejection_reason(status_request_state, owner_pinned_quota_error) is None
         retry_error_message = _websocket_event_error_message(event_type, payload)
+        quota_rejected_before_retry = status_request_state is not None and is_precreated_quota_rejection(
+            status_request_state, retry_error_code
+        )
         # An accepted anchored request waits only when the pre-created retry
         # can actually re-send it (proxy-injected anchor); a client-supplied
         # anchor falls through to the transparent-code branch, which forwards
@@ -3705,7 +3755,12 @@ class _HTTPBridgeUpstreamEventsMixin:
                     if status_request_state in session.pending_requests:
                         session.pending_requests.remove(status_request_state)
                         session.queued_request_count = max(0, session.queued_request_count - 1)
-                if staged:
+                if staged and quota_rejected_before_retry and status_request_state.error_code_override == "no_accounts":
+                    # Selection rejected the retry before any replacement send.
+                    # The provider's definitive quota terminal remains the cause;
+                    # synthesizing stream_incomplete would invent transport loss.
+                    _clear_websocket_request_error_overrides(status_request_state)
+                elif staged:
                     # A busy create gate forwards the upstream terminal as-is;
                     # only a replay that was attempted and failed is rewritten.
                     status_request_state.error_http_status_override = 502
@@ -4086,6 +4141,21 @@ class _HTTPBridgeUpstreamEventsMixin:
             if terminal_request_state.input_item_count > 0:
                 session.last_completed_input_count = terminal_request_state.input_item_count
                 session.last_completed_input_prefix_fingerprint = terminal_request_state.input_full_fingerprint
+
+        if (
+            terminal_request_state is not None
+            and terminal_request_state.recovery_alias_receipt is not None
+            and event_type in {"error", "response.failed"}
+            and is_precreated_quota_rejection(
+                terminal_request_state,
+                _normalize_error_code(
+                    _websocket_event_error_code(event_type, payload),
+                    _websocket_event_error_type(event_type, payload),
+                ),
+            )
+            and not has_other_pending_requests
+        ):
+            await _rollback_quota_rejected_recovery_alias(self, session, terminal_request_state)
 
         normalize_error_event = (
             (terminal_request_state is None or terminal_request_state.enforce_openai_sdk_contract)

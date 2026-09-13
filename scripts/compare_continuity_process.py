@@ -21,18 +21,17 @@ def main():
     parser.add_argument("--checkout", type=Path, action="append", required=True)
     parser.add_argument("--variant", action="append", help="Repeat for a subset; omitted runs the entire catalog.")
     parser.add_argument("--artifact", type=Path, required=True)
+    parser.add_argument("--temporary-root", type=Path, help="Disposable database directory; defaults to artifact/tmp.")
     args = parser.parse_args()
-    catalog = json.loads(
-        (Path(__file__).resolve().parents[1] / "tests/fixtures/continuity_scenarios.json").read_text()
-    )
+    catalog = json.loads((Path(__file__).resolve().parents[1] / "tests/fixtures/continuity_scenarios.json").read_text())
     scenarios = {scenario["id"]: scenario for scenario in catalog}
     variants = args.variant or list(scenarios)
     if any(variant not in scenarios for variant in variants):
         parser.error("unknown scenario; consult tests/fixtures/continuity_scenarios.json")
     artifact = args.artifact.resolve()
     artifact.mkdir(parents=True, exist_ok=True)
-    temporary = artifact / "tmp"
-    temporary.mkdir(exist_ok=True)
+    temporary = (args.temporary_root or artifact / "tmp").resolve()
+    temporary.mkdir(parents=True, exist_ok=True)
     source = Path(__file__).with_name("probe_historical_prefix.py").read_bytes()
     probe = artifact / "probe.py"
     if probe.exists() and probe.read_bytes() != source:

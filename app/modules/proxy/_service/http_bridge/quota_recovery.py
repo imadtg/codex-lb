@@ -11,6 +11,15 @@ _EXPLICIT_QUOTA_REJECTIONS = frozenset(
 )
 
 
+def is_precreated_quota_rejection(request: _WebSocketRequestState, error_code: str | None) -> bool:
+    return (
+        error_code in _EXPLICIT_QUOTA_REJECTIONS
+        and request.response_id is None
+        and request.response_event_count == 0
+        and not request.downstream_visible
+    )
+
+
 def quota_attempt_rejection_reason(request: _WebSocketRequestState | None, error_code: str | None) -> str | None:
     if error_code not in _EXPLICIT_QUOTA_REJECTIONS:
         return "not_explicit_quota"

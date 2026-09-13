@@ -12,9 +12,7 @@ from pathlib import Path
 import pytest
 
 pytestmark = pytest.mark.integration
-SCENARIOS = json.loads(
-    (Path(__file__).resolve().parents[1] / "fixtures/continuity_scenarios.json").read_text()
-)
+SCENARIOS = json.loads((Path(__file__).resolve().parents[1] / "fixtures/continuity_scenarios.json").read_text())
 
 
 @pytest.mark.parametrize(

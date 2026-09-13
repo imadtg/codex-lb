@@ -53005,7 +53005,7 @@ async def test_stream_with_retry_validates_only_lifecycle_frames_and_settles_usa
     # lifecycle frames keep it, with byte-identical SSE output and unchanged
     # usage settlement from the validated response.completed frame.
     from app.modules.proxy import tool_call_dedupe
-    from app.modules.proxy._service.streaming import mixin as streaming_mixin_module
+    from app.modules.proxy._service.streaming import helpers as streaming_frame_module
 
     settings = _make_proxy_settings()
     request_logs = _RequestLogsRecorder()
@@ -53020,8 +53020,8 @@ async def test_stream_with_retry_validates_only_lifecycle_frames_and_settles_usa
         AsyncMock(return_value=AccountSelection(account=account, error_message=None)),
     )
     monkeypatch.setattr(service, "_ensure_fresh_with_budget", AsyncMock(return_value=account))
-    mixin_validate = MagicMock(wraps=streaming_mixin_module.parse_sse_event_payload)
-    monkeypatch.setattr(streaming_mixin_module, "parse_sse_event_payload", mixin_validate)
+    mixin_validate = MagicMock(wraps=streaming_frame_module.parse_sse_event_payload)
+    monkeypatch.setattr(streaming_frame_module, "parse_sse_event_payload", mixin_validate)
     dedupe_validate = MagicMock(wraps=tool_call_dedupe.parse_sse_event_payload)
     monkeypatch.setattr(tool_call_dedupe, "parse_sse_event_payload", dedupe_validate)
 
@@ -53511,7 +53511,7 @@ async def test_stream_with_retry_relays_unmodified_canonical_delta_frames_verbat
     # relayed with upstream bytes (raw UTF-8, upstream spacing) and are never
     # JSON-parsed; usage settlement from the parsed terminal frame is
     # unchanged.
-    from app.modules.proxy._service.streaming import mixin as streaming_mixin_module
+    from app.modules.proxy._service.streaming import helpers as streaming_frame_module
 
     settings = _make_proxy_settings()
     request_logs = _RequestLogsRecorder()
@@ -53526,8 +53526,8 @@ async def test_stream_with_retry_relays_unmodified_canonical_delta_frames_verbat
         AsyncMock(return_value=AccountSelection(account=account, error_message=None)),
     )
     monkeypatch.setattr(service, "_ensure_fresh_with_budget", AsyncMock(return_value=account))
-    mixin_parse = MagicMock(wraps=streaming_mixin_module.parse_sse_data_json)
-    monkeypatch.setattr(streaming_mixin_module, "parse_sse_data_json", mixin_parse)
+    mixin_parse = MagicMock(wraps=streaming_frame_module.parse_sse_data_json)
+    monkeypatch.setattr(streaming_frame_module, "parse_sse_data_json", mixin_parse)
 
     verbatim_delta = (
         'event: response.output_text.delta\ndata: {"type": "response.output_text.delta", "delta": "안녕 upstream"}\n\n'

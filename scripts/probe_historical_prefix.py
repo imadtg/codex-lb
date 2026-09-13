@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout, FormData, web
 
@@ -61,11 +62,39 @@ def recovered_response(text):
     )
 
 
+def terminal_error_code(text):
+    events = response_events_from_wire(text)
+    errors = [
+        event.get("error") or event.get("response", {}).get("error")
+        for event in events
+        if event.get("error") or event.get("response", {}).get("error")
+    ]
+    assert len(errors) == 1, events
+    assert not any(event.get("type") == "response.completed" for event in events), events
+    return errors[0]["code"]
+
+
+def expected_replay_input(items):
+    # The subscription wire contract strips replay item IDs and tool-call
+    # namespaces (requests.py). Tool names, arguments and call/result IDs
+    # must remain identical; declarations keep their namespace schema.
+    return [
+        {
+            key: value
+            for key, value in item.items()
+            if key != "id" and not (key == "namespace" and item.get("type") in {"function_call", "custom_tool_call"})
+        }
+        for item in items
+    ]
+
+
 async def run(checkout, variant, artifact):
     calls = []
     response_turn_states: list[str | None] = []
-    fresh_prewarm = variant == "fresh_prewarm_capacity"
-    replacement_exhausted = variant == "quota_bridge_replacement_exhausted"
+    fresh_prewarm = variant == "fresh_prewarm_capacity_refusal"
+    replacement_exhausted = variant.startswith("quota_bridge_replacement_")
+    replacement_accepted = variant == "quota_bridge_replacement_accepted"
+    replacement_ambiguous = variant == "quota_bridge_replacement_ambiguous"
     healthy = variant == "quota_bridge_healthy"
     namespaced_tool = variant == "quota_bridge_namespace_plain_prefix"
     bridge_quota = variant.startswith("quota_bridge")
@@ -178,6 +207,17 @@ async def run(checkout, variant, artifact):
                     await ws.send_json(
                         {"type": "response.created", "response": {"id": "resp_accepted", "status": "in_progress"}}
                     )
+                if replacement_exhausted and account == "synthetic-alternate":
+                    if replacement_ambiguous:
+                        await ws.close()
+                        break
+                    if replacement_accepted:
+                        await ws.send_json(
+                            {
+                                "type": "response.created",
+                                "response": {"id": "resp_replacement", "status": "in_progress"},
+                            }
+                        )
                 if visible_failure:
                     await ws.send_json(
                         {
@@ -252,7 +292,7 @@ async def run(checkout, variant, artifact):
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
     artifact.mkdir(parents=True, exist_ok=True)
-    report = {
+    report: dict[str, Any] = {
         "variant": variant,
         "checkout": str(checkout),
         "calls": calls,
@@ -399,7 +439,10 @@ async def run(checkout, variant, artifact):
                         "tools": [{"type": "custom", "name": "apply_patch", "description": "Apply a patch"}],
                     }
                     if namespaced_tool:
-                        prefix = prefix[1:]
+                        # Use the ordinary, non-Lite wire form for this case:
+                        # base instructions live at top level, not in input.
+                        prefix = prefix[2:]
+                        body["instructions"] += "\nSynthetic base instructions"
                         body["tools"] = [
                             {
                                 "type": "namespace",
@@ -488,7 +531,7 @@ async def run(checkout, variant, artifact):
                         exhausted_accounts.add("synthetic-alternate")
                     if not direct_quota and not bridge_quota and not fresh_prewarm:
                         await api("POST", f"/api/accounts/{owner}/pause")
-                    full = [*prefix, tool, result, {"role": "user", "content": "Continue"}]
+                    full: list[dict[str, Any]] = [*prefix, tool, result, {"role": "user", "content": "Continue"}]
                     if fresh_prewarm:
                         full = [*prefix, {"role": "user", "content": "First real task"}]
                     if "suffix_agent" in variant:
@@ -529,11 +572,23 @@ async def run(checkout, variant, artifact):
                             "synthetic-alternate",
                         ], calls
                         report["exhausted_error"] = response_events_from_wire(report["second"][1])
+                        assert terminal_error_code(report["second"][1]) == (
+                            "stream_incomplete" if replacement_ambiguous else "usage_limit_reached"
+                        ), report["second"]
                         await account("synthetic-third")
                         report["retry"] = await send(full)
+                        if replacement_accepted or replacement_ambiguous:
+                            assert terminal_error_code(report["retry"][1]) == (
+                                "stream_incomplete" if replacement_ambiguous else "previous_response_owner_unavailable"
+                            ), report["retry"]
+                            assert all(call["account"] != "synthetic-third" for call in calls), calls
+                            report["passed"] = True
+                            return True
                         assert recovered_response(report["retry"][1]), report["retry"]
                         assert calls[-1]["account"] == "synthetic-third", calls
                         assert not calls[-1]["body"].get("previous_response_id"), calls
+                        assert not calls[-1].get("turn_state"), calls[-1]
+                        assert calls[-1]["body"]["input"] == expected_replay_input(full), calls[-1]
                         report["passed"] = True
                         return True
                     report["recovered"] = recovered_response(report["second"][1])
@@ -546,9 +601,9 @@ async def run(checkout, variant, artifact):
                         assert calls[-1]["account"] == "synthetic-alternate"
                         assert not calls[-1]["body"].get("previous_response_id")
                         assert not calls[-1].get("turn_state"), "Old account token crossed the handoff"
-                        assert calls[-1]["body"]["input"] == [
-                            {key: value for key, value in item.items() if key != "id"} for item in full
-                        ]
+                        assert calls[-1]["body"]["input"] == expected_replay_input(full), calls[-1]
+                        if namespaced_tool:
+                            assert calls[-1]["body"]["tools"] == calls[0]["body"]["tools"], calls[-1]
                         if bridge_quota:
                             prior_call_count = len(calls)
                             followup_answer = {
@@ -584,9 +639,7 @@ async def run(checkout, variant, artifact):
                                 ], calls
                                 assert not calls[-1].get("turn_state"), calls
                                 assert not calls[-1]["body"].get("previous_response_id"), calls
-                                assert calls[-1]["body"]["input"] == [
-                                    {key: value for key, value in item.items() if key != "id"} for item in full
-                                ]
+                                assert calls[-1]["body"]["input"] == expected_replay_input(full), calls[-1]
                                 full = [
                                     *full,
                                     {**followup_answer, "id": f"msg_answer_{len(calls)}"},
@@ -605,19 +658,22 @@ async def run(checkout, variant, artifact):
                         assert all(call["account"] == "synthetic-owner" for call in calls), calls
                         if not bridge_quota:
                             assert len(calls) == 1, "unsafe history was dispatched again"
-                        envelope = json.loads(report["second"][1])
-                        refusal = (report["second"][0], envelope["error"]["code"])
+                        refusal = (report["second"][0], terminal_error_code(report["second"][1]))
                         # Portability controls forbid a cross-account dispatch.
                         # Forwarded owner quota and an unavailable-owner refusal
                         # are distinct documented outcomes, recorded separately.
                         # Generic 4xx/5xx errors are never accepted as success.
                         if refusal == (502, "upstream_unavailable"):
+                            envelope = json.loads(report["second"][1])
                             assert (
                                 envelope["error"]["message"]
                                 == "Previous response owner account is unavailable; retry later."
                             )
                         else:
                             assert refusal in {
+                                # Native error frames can follow a committed
+                                # SSE keepalive. Check the terminal, not HTTP 200.
+                                (200, "usage_limit_reached"),
                                 (429, "usage_limit_reached"),
                                 (502, "previous_response_owner_unavailable"),
                             }, report["second"]
@@ -631,18 +687,24 @@ async def run(checkout, variant, artifact):
                                 "Already shown"
                             ]
                     if fresh_prewarm:
-                        assert report["recovered"], report["second"]
+                        # Preserve beta.8's documented sequence boundary. A
+                        # completed prewarm sends a delta; we do not invent a
+                        # transcript reconstruction/sequence-remapping contract.
+                        assert not report["recovered"], report["second"]
                         assert [call["account"] for call in calls] == [
                             "synthetic-owner",
                             "synthetic-owner",
-                            "synthetic-alternate",
                         ]
-                        assert not calls[-1]["body"].get("previous_response_id")
                         events = report["native_events"][-1]
                         assert [e["sequence_number"] for e in events] == list(range(len(events)))
                         assert sum(e["type"] == "response.created" for e in events) == 1
-                        assert events[-1]["response"]["id"] == events[0]["response"]["id"]
+                        assert events[-1]["type"] == "error", events
+                        assert events[-1]["error"]["code"] == "server_is_overloaded", events
+                        assert events[-1]["status"] == 503, events
+                        assert downstream_ws is not None
                         await downstream_ws.close()
+                        report["passed"] = True
+                        return True
                     report["passed"] = report["recovered"] == (
                         not unsafe_history
                         and not accepted_failure
@@ -683,7 +745,9 @@ if __name__ == "__main__":
             "quota_bridge_agent_message_plain_prefix",
             "quota_bridge_healthy",
             "quota_bridge_replacement_exhausted",
-            "fresh_prewarm_capacity",
+            "quota_bridge_replacement_accepted",
+            "quota_bridge_replacement_ambiguous",
+            "fresh_prewarm_capacity_refusal",
             "quota_bridge_turn_state_suffix_agent_chain",
             "quota_bridge_turn_state_suffix_agent",
             "quota_bridge_turn_state_suffix_agent_encrypted",

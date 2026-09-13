@@ -2808,7 +2808,6 @@ async def _persist_http_bridge_replacement_account(
             owner_epoch=session.durable_owner_epoch,
             account_id=account_id,
             clear_continuity=True,
-            preserve_replay_proof=True,
         )
     except Exception as exc:
         raise ProxyResponseError(

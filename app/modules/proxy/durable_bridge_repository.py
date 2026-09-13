@@ -1388,6 +1388,8 @@ class DurableBridgeRepository:
                 HttpBridgeSessionRecord.owner_instance_id == instance_id,
                 HttpBridgeSessionRecord.owner_epoch == owner_epoch,
             ]
+            if preserve_replay_proof:
+                conditions.append(HttpBridgeSessionRecord.account_id == account_id)
             if clear_continuity:
                 values.update(
                     latest_turn_state=None,

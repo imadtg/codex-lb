@@ -2191,6 +2191,12 @@ class _HTTPBridgeRequestSubmitMixin:
                         admission_waiter_registered = False
                     request_enqueued = True
 
+                    # Keep the reversible publication until the provider accepts
+                    # the replacement. A definitive pre-created rejection must
+                    # not strand the client alias on a lane without completion
+                    # evidence. Publish before send: the reader may win the race.
+                    request_state.recovery_alias_receipt = recovery_receipt
+
                     def mark_upstream_send_started() -> None:
                         nonlocal upstream_send_started
                         # The helper invokes this only after the final frame
