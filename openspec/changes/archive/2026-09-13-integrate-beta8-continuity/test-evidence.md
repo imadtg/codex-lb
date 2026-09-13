@@ -213,4 +213,18 @@ The broad SQLite run emitted shutdown-thread warnings and is not evidence of
 warning-free database teardown. The process tests demonstrate routing and wire
 contracts with synthetic providers, not successful inference against real accounts.
 
-The final matrix is recorded below when complete.
+Final comparison `final-comparison-2/summary.json` completed all 46 runs: candidate
+23/23 passed; unmodified beta.8 9/23 passed, with 14 scenario failures and no setup
+failures. Both used probe SHA-256
+`1c8bc26523024dacbf5241e811a0a33468a1769856fca42c8b092d6dcab4e512`.
+The replacement acceptance/ambiguity controls fail on beta.8 before reaching
+their replacement stage, because the initial handoff is absent; those failures
+do not demonstrate unsafe replay by beta.8.
+
+During the candidate matrix, the quota pre-created check was moved before retry
+staging, then formatted. The first two scenarios were rerun against committed
+candidate `772abcb9` in `final-first-cases-committed-2`: both passed. Remaining
+candidate cases ran after the semantic correction; the later edit was formatting.
+The complete bridge suite and static checks cover the final application state.
+These are documented evidence boundaries, not a claim that every run was launched
+from the same clean Git snapshot.
