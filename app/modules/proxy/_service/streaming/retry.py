@@ -1643,6 +1643,21 @@ class _StreamingRetryMixin:
                         )
                     ):
                         recovery_sleep_seconds = _account_selection_recovery_sleep_seconds(selection)
+                        if (
+                            recovery_sleep_seconds is not None
+                            and selection.error_code == "hard_affinity_saturated"
+                            and upstream_websocket_transport_recently_failed()
+                        ):
+                            # A process restart arms this marker after the
+                            # previous websocket generation is gone. A hard
+                            # owner cannot recover by waiting for capacity;
+                            # surface the restart boundary promptly instead of
+                            # retaining a multi-hour capacity waiter.
+                            _facade().logger.info(
+                                "Ending hard-owner capacity wait after recent websocket restart request_id=%s",
+                                request_id,
+                            )
+                            recovery_sleep_seconds = None
                         if recovery_sleep_seconds is not None:
                             remaining_budget_seconds = proxy._remaining_budget_seconds(deadline)
                             if remaining_budget_seconds <= 0:
