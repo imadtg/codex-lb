@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "experiment": "cross-account encrypted agent_message portability",
+  "observed_at": "2026-09-15",
+  "endpoint": "https://chatgpt.com/backend-api/codex/responses",
+  "model": "gpt-6-astra",
+  "accounts": "two verified-distinct ChatGPT accounts; identifiers not retained",
+  "source_operation_id_sha256": "f2a9b545026748ece6521654a63d7fcdbae34f2276cb81beea729e202f6b237f",
+  "input": {
+    "shape": [
+      "input_text",
+      "encrypted_content"
+    ],
+    "ciphertext_bytes": 612,
+    "top_level_response_owned_ids_removed": true,
+    "raw_ciphertext_retained": false
+  },
+  "request_invariants": {
+    "store": false,
+    "previous_response_id": false,
+    "prompt_cache_key": false,
+    "tools": false,
+    "via_codex_lb": false
+  },
+  "results": {
+    "valid_ciphertext": {
+      "http_status": 200,
+      "saw_response_created": true,
+      "completed": true,
+      "controlled_output": "DECRYPTED"
+    },
+    "single_character_corruption": {
+      "saw_response_created": true,
+      "completed": false,
+      "error_code": "invalid_encrypted_content"
+    },
+    "client_version_0_152_0": {
+      "completed": false,
+      "pre_inference_rejection": "gpt-6-astra requires a newer version of Codex",
+      "evidentiary_value_for_portability": false
+    }
+  },
+  "versions": {
+    "codex_lb_base": "v1.25.0-beta.8 bb4db9d08cc955743735678ccdb8d8bef19f7bea",
+    "codex_lb_fix": "bdf3e5ef2d248dcf2f6060ec92bac50a8e28c0af",
+    "codex_source": "0.152.0 316795b3cf2a45e90d121d9f46499d4658b2645c",
+    "installed_codex_cli": "0.153.4",
+    "successful_client_version_header": "0.154.0",
+    "python_environment": "3.13.12",
+    "openai_backend": "unversioned service observed 2026-09-15"
+  },
+  "privacy": {
+    "contains_access_token": false,
+    "contains_raw_ciphertext": false,
+    "contains_decrypted_payload": false,
+    "contains_account_identifier": false,
+    "contains_database_record": false
+  }
+}
