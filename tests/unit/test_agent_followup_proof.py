@@ -65,14 +65,23 @@ def test_manifest_must_be_exactly_settled_before_agent_followup(suffix, expected
     )
 
 
-@pytest.mark.parametrize("mutation", ["encrypted", "recipient", "unknown", "empty"])
+def test_encrypted_agent_can_supply_followup_after_exact_tool_settlement():
+    agent = deepcopy(AGENT)
+    content = agent["content"]
+    assert isinstance(content, list)
+    content.append({"type": "encrypted_content", "encrypted_content": "opaque"})
+
+    assert responses_input_suffix_retains_prior_output([*PREFIX, ANSWER, agent], stored_count=1)
+    assert responses_input_suffix_retains_prior_output([*PREFIX, agent, ANSWER, USER], stored_count=1)
+    assert responses_input_suffix_matches_pending_tool_calls(
+        [*PREFIX, CALL, RESULT, agent], stored_count=1, pending_tool_calls={"call_1": "function_call"}
+    )
+
+
+@pytest.mark.parametrize("mutation", ["recipient", "unknown", "empty"])
 def test_malformed_agent_cannot_supply_followup_or_cross_historical_proof(mutation):
     agent = deepcopy(AGENT)
-    if mutation == "encrypted":
-        content = agent["content"]
-        assert isinstance(content, list)
-        content.append({"type": "encrypted_content", "encrypted_content": "opaque"})
-    elif mutation == "recipient":
+    if mutation == "recipient":
         agent["recipient"] = ""
     elif mutation == "unknown":
         agent["future_field"] = "opaque"

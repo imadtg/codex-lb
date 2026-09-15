@@ -408,23 +408,16 @@ def responses_input_replay_rejection_reason(input_items: list[JsonValue]) -> str
 
 def _agent_message_replay_rejection_reason(item: Mapping[str, JsonValue]) -> str | None:
     # Agent messages are native Codex history, not ordinary role messages.
-    # Preserve author/recipient semantics; never discard opaque content.
+    # Preserve author/recipient semantics and Responses-owned ciphertext
+    # verbatim. The Codex-to-provider portability gate separately rejects every
+    # agent_message, so accepting the encrypted native shape here can only move
+    # it between OpenAI Codex accounts.
     if set(item) - {"type", "id", "author", "recipient", "content", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD}:
         return "agent_message_fields"
     if not _is_nonblank_string(item.get("author")) or not _is_nonblank_string(item.get("recipient")):
         return "agent_message_routing"
     content = item.get("content")
-    if (
-        not isinstance(content, list)
-        or not content
-        or not all(
-            isinstance(part, dict)
-            and set(part) == {"type", "text"}
-            and part.get("type") == "input_text"
-            and _is_nonblank_string(part.get("text"))
-            for part in content
-        )
-    ):
+    if not isinstance(content, list) or not _agent_message_content_is_replayable(content):
         return "agent_message_content"
     metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
     if metadata is not None:
@@ -442,6 +435,36 @@ def _agent_message_replay_rejection_reason(item: Mapping[str, JsonValue]) -> str
             except OverflowError:
                 return "agent_message_metadata"
     return None
+
+
+def _agent_message_content_is_replayable(content: list[JsonValue]) -> bool:
+    """Accept exact plaintext and Responses-encrypted Codex delivery shapes."""
+
+    if not content:
+        return False
+
+    def is_plaintext(part: JsonValue) -> bool:
+        return (
+            isinstance(part, dict)
+            and set(part) == {"type", "text"}
+            and part.get("type") == "input_text"
+            and _is_nonblank_string(part.get("text"))
+        )
+
+    def is_encrypted(part: JsonValue) -> bool:
+        return (
+            isinstance(part, dict)
+            and set(part) == {"type", "encrypted_content"}
+            and part.get("type") == "encrypted_content"
+            and _is_nonblank_string(part.get("encrypted_content"))
+        )
+
+    # Codex emits an envelope followed by ciphertext. Preserve the pre-existing
+    # all-plaintext form, including multiple plaintext fragments, but accept no
+    # encrypted shape beyond the one Codex and Responses jointly define.
+    return all(is_plaintext(part) for part in content) or (
+        len(content) == 2 and is_plaintext(content[0]) and is_encrypted(content[1])
+    )
 
 
 def _internal_chat_message_metadata_is_account_neutral(value: JsonValue | None) -> bool:
@@ -1298,6 +1321,14 @@ def _contains_account_scoped_input_state(value: JsonValue) -> bool:
         current = pending.pop()
         if isinstance(current, dict):
             item_type = current.get("type")
+            if item_type == "agent_message":
+                # Shape validation has already admitted only native plaintext
+                # or Responses-encrypted delivery shapes. Do not let
+                # the generic opaque-state scan reclassify that one protocol
+                # field as account-owned state.
+                if _agent_message_replay_rejection_reason(current) is None:
+                    continue
+                return True
             if isinstance(item_type, str) and item_type in _ACCOUNT_SCOPED_HOSTED_INPUT_TYPES:
                 return True
             if isinstance(item_type, str) and item_type.startswith("mcp_"):

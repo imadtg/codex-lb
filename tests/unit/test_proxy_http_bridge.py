@@ -17253,13 +17253,15 @@ async def test_stream_via_http_bridge_proves_fallback_owner_key_before_legacy_fo
         "retains_prior_output",
         "takeover_context_matches",
         "takeover_account_id",
+        "encrypted_agent_followup",
     ),
     [
-        pytest.param(False, True, True, "acc-1", id="local-create-safe-resend"),
-        pytest.param(True, True, True, "acc-1", id="owner-forward-safe-resend"),
-        pytest.param(True, False, True, "acc-1", id="owner-forward-unsafe-resend"),
-        pytest.param(True, False, True, "acc-2", id="owner-forward-refreshed-account"),
-        pytest.param(True, False, False, "acc-1", id="owner-forward-refreshed-prefix-mismatch"),
+        pytest.param(False, True, True, "acc-1", False, id="local-create-safe-resend"),
+        pytest.param(True, True, True, "acc-1", False, id="owner-forward-safe-resend"),
+        pytest.param(True, False, True, "acc-1", False, id="owner-forward-unsafe-resend"),
+        pytest.param(True, False, True, "acc-2", False, id="owner-forward-refreshed-account"),
+        pytest.param(True, False, False, "acc-1", False, id="owner-forward-refreshed-prefix-mismatch"),
+        pytest.param(False, True, True, "acc-1", True, id="encrypted-agent-followup"),
     ],
 )
 async def test_stream_via_http_bridge_preserves_context_after_owner_unavailable(
@@ -17268,6 +17270,7 @@ async def test_stream_via_http_bridge_preserves_context_after_owner_unavailable(
     retains_prior_output: bool,
     takeover_context_matches: bool,
     takeover_account_id: str,
+    encrypted_agent_followup: bool,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     prefix_items = [{"role": "user", "content": "one"}]
@@ -17277,7 +17280,36 @@ async def test_stream_via_http_bridge_preserves_context_after_owner_unavailable(
         "content": [{"type": "output_text", "text": "two"}],
     }
     input_items = [*prefix_items]
-    if retains_prior_output:
+    encrypted_content = "gAAAAABcross-account-validated-ciphertext"
+    if encrypted_agent_followup:
+        input_items.extend(
+            [
+                {
+                    "type": "function_call",
+                    "id": "fc_response_owned",
+                    "call_id": "call-1",
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "fco_response_owned",
+                    "call_id": "call-1",
+                    "output": "result",
+                },
+                {
+                    "type": "agent_message",
+                    "id": "msg_response_owned",
+                    "author": "agent-a",
+                    "recipient": "agent-b",
+                    "content": [
+                        {"type": "input_text", "text": "Message Type: MESSAGE\nPayload:\n"},
+                        {"type": "encrypted_content", "encrypted_content": encrypted_content},
+                    ],
+                },
+            ]
+        )
+    elif retains_prior_output:
         input_items.append(retained_output)
     input_items.append({"role": "user", "content": "three"})
     payload = proxy_service.ResponsesRequest.model_validate(
@@ -17414,6 +17446,7 @@ async def test_stream_via_http_bridge_preserves_context_after_owner_unavailable(
         latest_response_id="resp_latest",
         latest_input_item_count=len(prefix_items),
         latest_input_full_fingerprint=proxy_service._fingerprint_input_items(payload_prefix_items),
+        latest_pending_tool_calls={"call-1": "function_call"} if encrypted_agent_followup else None,
     )
     takeover_lookup = replace(
         durable_lookup,
@@ -17433,6 +17466,16 @@ async def test_stream_via_http_bridge_preserves_context_after_owner_unavailable(
             else None,
             return_value=durable_lookup,
         ),
+    )
+    monkeypatch.setattr(
+        service._durable_bridge,
+        "retire_continuity_owner_if_unavailable",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        service,
+        "_ensure_http_bridge_retry_circuit_loaded_for_key",
+        AsyncMock(),
     )
     monkeypatch.setattr(service, "_http_bridge_has_live_local_session", AsyncMock(return_value=False))
     monkeypatch.setattr(
@@ -17489,6 +17532,14 @@ async def test_stream_via_http_bridge_preserves_context_after_owner_unavailable(
     else:
         assert prepared_previous_response_ids == [None, None]
         assert forwarded_payloads == []
+    if encrypted_agent_followup:
+        replay_input = cast(list[dict[str, Any]], prepared_inputs[-1])
+        assert all("id" not in item for item in replay_input if isinstance(item, dict))
+        encrypted_parts = cast(list[dict[str, Any]], replay_input[-2]["content"])
+        assert encrypted_parts[-1] == {
+            "type": "encrypted_content",
+            "encrypted_content": encrypted_content,
+        }
     assert get_or_create_kwargs[-1]["allow_forward_to_owner"] is False
     assert get_or_create_kwargs[-1]["exclude_account_ids"] == ({"acc-1"} if retains_prior_output else None)
     assert get_or_create_kwargs[-1]["preferred_account_id"] == (None if retains_prior_output else takeover_account_id)

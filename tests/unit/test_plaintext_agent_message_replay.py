@@ -36,8 +36,20 @@ def projected_payload(item):
     return {"input": projection.input_items}
 
 
-def test_plaintext_agent_message_is_preserved_only_for_codex_accounts():
+@pytest.mark.parametrize(
+    "content",
+    [
+        [{"type": "input_text", "text": "Verified findings"}],
+        [
+            {"type": "input_text", "text": "Message Type: MESSAGE\nPayload:\n"},
+            {"type": "encrypted_content", "encrypted_content": "opaque"},
+        ],
+    ],
+    ids=["plaintext", "envelope-and-encrypted"],
+)
+def test_native_agent_message_is_preserved_only_for_codex_accounts(content):
     item = agent_message()
+    item["content"] = content
     before = deepcopy(item)
     payload = projected_payload(item)
     assert payload["input"][0] == {k: v for k, v in item.items() if k != "id"}
@@ -59,10 +71,12 @@ def test_plaintext_agent_message_is_preserved_only_for_codex_accounts():
         {"content": [{"type": "encrypted_content", "encrypted_content": "opaque"}]},
         {
             "content": [
-                {"type": "input_text", "text": "text"},
                 {"type": "encrypted_content", "encrypted_content": "opaque"},
+                {"type": "input_text", "text": "text"},
             ]
         },
+        {"content": [{"type": "encrypted_content", "encrypted_content": ""}]},
+        {"content": [{"type": "encrypted_content", "encrypted_content": "opaque", "future": True}]},
         {"container_id": "owned"},
         {"internal_chat_message_metadata_passthrough": {"unknown": "value"}},
         {"internal_chat_message_metadata_passthrough": {"turn_id": 42}},
