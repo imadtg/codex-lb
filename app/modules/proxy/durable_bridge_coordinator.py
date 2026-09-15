@@ -1040,6 +1040,7 @@ class DurableBridgeSessionCoordinator:
         session_id: str,
         expected_account_id: str,
         recovery_deadline_epoch: int,
+        linked_turn_state: str | None = None,
     ) -> bool:
         """Retire a row's owner now when it cannot return before the deadline."""
         async with self._session() as session:
@@ -1047,6 +1048,7 @@ class DurableBridgeSessionCoordinator:
                 session_id,
                 expected_account_id=expected_account_id,
                 recovery_deadline_epoch=recovery_deadline_epoch,
+                linked_turn_state=linked_turn_state,
             )
 
     async def mark_instance_draining(self, *, instance_id: str) -> int:

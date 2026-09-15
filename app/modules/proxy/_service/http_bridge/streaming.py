@@ -2337,6 +2337,7 @@ class _HTTPBridgeStreamingMixin:
                 recovery_deadline_epoch=int(
                     clock.time() + max(0.0, request_deadline - clock.monotonic()),
                 ),
+                linked_turn_state=durable_lookup.latest_turn_state,
             )
             if not retired:
                 return False

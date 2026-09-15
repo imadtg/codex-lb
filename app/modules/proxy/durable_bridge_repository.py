@@ -33,6 +33,8 @@ from app.db.models import (
     HttpBridgeSessionAlias,
     HttpBridgeSessionRecord,
     HttpBridgeSessionState,
+    StickySession,
+    StickySessionKind,
 )
 from app.db.session import sqlite_writer_section
 from app.modules.proxy.account_eligibility import HARD_OWNER_UNAVAILABLE_STATUSES
@@ -69,6 +71,11 @@ _PURGE_CLOSED_BATCH_SIZE = 500
 # Marks a retirement taken on the request path rather than by the sweep.
 # The sweep writes the global timestamp form instead; both read as retired.
 _REQUEST_PATH_ABANDONMENT_SCOPE = "request_path"
+# A request-path bridge retirement can leave the bridge's latest turn state as
+# a second hard ownership index. Retire that source in the same transaction so
+# the anchor-free retry does not immediately pin itself back to the owner that
+# the bridge row just abandoned.
+_TURN_STATE_ABANDONMENT_SCOPE = "turn_state"
 # Claim retry budget: insert races and epoch-CAS losses re-read and retry;
 # each round has a winner, so a small budget converges under any realistic
 # same-row claim contention.
@@ -3614,6 +3621,7 @@ class DurableBridgeRepository:
         *,
         expected_account_id: str,
         recovery_deadline_epoch: int,
+        linked_turn_state: str | None = None,
     ) -> bool:
         """Retire one row's owner now, when it cannot return before the deadline.
 
@@ -3633,9 +3641,11 @@ class DurableBridgeRepository:
         invariant so a later refactor cannot turn a prior observation into an
         unconditional write.
 
-        Writes the scope marker alone and leaves the timestamp NULL, so a
-        replica running the previous build keeps treating ``account_id`` as
-        hard ownership for the rest of a rolling deploy.
+        When ``linked_turn_state`` names the bridge's current hard sticky
+        owner, retire that second ownership index in the same transaction.
+        Both rows receive only a scope marker and keep their timestamp NULL,
+        so a replica running the previous build continues to treat
+        ``account_id`` as hard ownership for the rest of a rolling deploy.
         """
         if not session_id or not expected_account_id:
             return False
@@ -3672,8 +3682,26 @@ class DurableBridgeRepository:
                 await self._session.commit()
                 return False
             result = await self._session.execute(statement)
+            retired_session_id = result.scalar_one_or_none()
+            if retired_session_id is not None and linked_turn_state:
+                await self._session.execute(
+                    update(StickySession)
+                    .where(
+                        StickySession.key == linked_turn_state,
+                        StickySession.kind == StickySessionKind.CODEX_SESSION,
+                        StickySession.account_id == expected_account_id,
+                        StickySession.continuity_abandoned_at.is_(None),
+                        StickySession.continuity_abandonment_scope.is_(None),
+                        StickySession.account_id.in_(unavailable_owner),
+                    )
+                    .values(
+                        updated_at=func.now(),
+                        continuity_abandoned_at=None,
+                        continuity_abandonment_scope=_TURN_STATE_ABANDONMENT_SCOPE,
+                    )
+                )
             await self._session.commit()
-        return result.scalar_one_or_none() is not None
+        return retired_session_id is not None
 
     async def retire_stale_unavailable_bridge_owners(self, cutoff: datetime, *, now: datetime) -> int:
         """Retire continuity owners that have been unroutable since ``cutoff``.
