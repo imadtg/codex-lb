@@ -17,7 +17,7 @@ import asyncio
 import pytest
 
 from app.core.clock import RealScheduler
-from app.core.utils.shared_future import _WAITERS_ATTR, wait_on_shared_future
+from app.core.utils.shared_future import _WAITERS_ATTR, _fan_out, wait_on_shared_future
 
 pytestmark = pytest.mark.unit
 
@@ -105,6 +105,23 @@ async def test_done_shared_returns_immediately():
     failed.set_exception(RuntimeError("boom"))
     with pytest.raises(RuntimeError, match="boom"):
         await wait_on_shared_future(failed)
+
+
+async def test_done_callback_retrieves_exception_when_all_waiters_timed_out():
+    """A late task failure must not become an asyncio unhandled-exception log.
+
+    This is the race in ``inject_sse_keepalives``: a timeout removes its only
+    proxy waiter, then the source task finishes with ``StopAsyncIteration``.
+    The shared-future callback still owns the task's terminal result and must
+    retrieve it even when there are no proxies left to notify.
+    """
+    shared: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    shared.set_exception(StopAsyncIteration())
+
+    _fan_out(shared, set())
+
+    with pytest.raises(StopAsyncIteration):
+        shared.result()
 
 
 async def test_late_waiter_after_fan_out_gets_result():

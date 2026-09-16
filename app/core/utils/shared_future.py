@@ -35,6 +35,14 @@ _WAITERS_ATTR = "_shared_future_fanout_waiters"
 
 
 def _fan_out(shared: "asyncio.Future[_T]", waiters: "set[asyncio.Future[_T]]") -> None:
+    # A waiter may time out immediately before the shared task completes.  In
+    # that interval the done callback still runs, but the waiter set is empty;
+    # leaving the task exception untouched produces ``Task exception was never
+    # retrieved`` when the task is later replaced (the SSE keepalive wrapper
+    # hit this with a normal ``StopAsyncIteration`` close).  Retrieve the
+    # terminal exception once even when there is nobody left to fan it out to.
+    if not shared.cancelled():
+        shared.exception()
     for waiter in waiters:
         if waiter.done():
             continue
