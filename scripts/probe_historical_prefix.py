@@ -114,7 +114,9 @@ async def run(checkout, variant, artifact):
     visible_failure = variant == "quota_bridge_visible_failure"
     accepted_failure = "accepted_failure" in variant or visible_failure
     exhausted_accounts = set()
-    unsafe_history = any(reason in variant for reason in ("changed_prefix", "missing_output", "encrypted"))
+    unsafe_history = any(reason in variant for reason in ("changed_prefix", "missing_output")) or (
+        variant == "quota_bridge_commentary_tool_encrypted"
+    )
     tool = {
         "type": "custom_tool_call",
         "id": "ct_synthetic",
