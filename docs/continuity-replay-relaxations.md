@@ -16,11 +16,42 @@ The detailed beta.8 comparison and source ledger remain in
 | Codex namespace declarations and call identity can survive account handoff | Nested tools are recursively validated; provider projection remains separately closed | Codex source plus disposable public-process scenarios |
 | The exact host `codex_app.automation_update` heartbeat can act as fresh input | Exact field set, heartbeat XML shape, finite timestamp, and no unsettled call | Upstream maintainer review evidence plus malformed-shape controls |
 | Encrypted collaboration `agent_message` delivery can move between ChatGPT accounts | Exactly `[input_text envelope, encrypted_content]`; ciphertext is nonblank and preserved verbatim; all response-owned item IDs and the old response anchor are removed | Direct OpenAI valid/corrupt experiment, Codex source, helper tests, and an HTTP-bridge regression |
+| A pre-visible permanent credential rejection releases a soft dispatch owner | Only an unanchored full resend may move, and only after the existing projection produces an account-neutral replacement body; previous-response, turn-state, and file owners remain strict | Read-only production trace reduction plus a public-route integration regression |
 
 The first five allowances landed earlier in this fork. Commit `bdf3e5ef` adds
 the encrypted collaboration allowance. This ledger should gain a row whenever
 another conservative replay rejection is relaxed, including its precise proof
 and rollback condition.
+
+## Revoked credential dispatch-owner incident
+
+On 2026-09-16, three unanchored HTTP requests selected an account whose OAuth
+token OpenAI rejected as `token_revoked`. Each request carried full compacted
+history with retained `reasoning`, so initial dispatch correctly established a
+provisional body owner. The forced refresh then permanently disabled that
+account and excluded it from the retry pool, but left the provisional owner in
+place. Selection therefore required and excluded the same account and replaced
+the useful auth failure with `preferred_account_unavailable`, even though other
+accounts were serving the same model.
+
+Commit `c90f5d10` applies the same fail-closed replay projection already used
+for pre-visible quota rejection when a post-401 forced refresh fails
+permanently. If projection succeeds, response-owned bookkeeping such as
+retained reasoning is omitted and the unanchored client history moves to the
+next account. If projection fails, the dispatch owner remains strict. The
+change cannot release previous-response, turn-state, file, or single-account
+ownership.
+
+The route-level regression
+`test_proxy_post_401_permanent_refresh_releases_lease_and_portable_history`
+recreates the production sequence through `/backend-api/codex/responses`: the
+first upstream account returns `token_revoked`, its forced refresh fails
+permanently, and a second eligible account receives the projected history and
+completes. On the preceding commit, the compacted-history case ends with
+`preferred_account_unavailable`; on `c90f5d10`, it completes on the alternate.
+The trace now records `stage=account_handoff`,
+`reason=plaintext_replay_eligible`, and outcome
+`owner_post_401_permanent_auth_rejection` when this release occurs.
 
 ## Encrypted collaboration experiment
 
