@@ -36,7 +36,14 @@ def correlation_hash(value: str | None) -> str | None:
 
 
 DECISION_STAGES = frozenset(
-    ["durable_context_proof", "http_ingress", "payload_portability", "quota_handoff", "retry_body"]
+    [
+        "account_handoff",
+        "durable_context_proof",
+        "http_ingress",
+        "payload_portability",
+        "quota_handoff",
+        "retry_body",
+    ]
 )
 DECISION_REASONS = frozenset(
     [

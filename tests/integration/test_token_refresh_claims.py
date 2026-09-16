@@ -1444,16 +1444,48 @@ async def test_proxy_preflight_permanent_refresh_releases_lease_before_failover(
 
 
 @pytest.mark.asyncio
-async def test_proxy_post_401_permanent_refresh_releases_lease_before_failover(async_client, monkeypatch):
+@pytest.mark.parametrize(
+    "input_items",
+    [
+        pytest.param([], id="account-neutral"),
+        pytest.param(
+            [
+                {"type": "message", "role": "user", "content": "Earlier task"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_compacted_history",
+                    "encrypted_content": "synthetic-retained-reasoning",
+                    "summary": [],
+                },
+                {
+                    "type": "message",
+                    "id": "msg_completed_turn",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "Earlier answer"}],
+                },
+                {"type": "message", "role": "user", "content": "Continue"},
+            ],
+            id="unanchored-compacted-history",
+        ),
+    ],
+)
+async def test_proxy_post_401_permanent_refresh_releases_lease_and_portable_history(
+    async_client,
+    monkeypatch,
+    input_items,
+):
     """Route-level regression for the post-401 forced-refresh PERMANENT branch.
 
-    The proactive freshness check succeeds so the stream opens; the upstream
-    returns a 401 and the subsequent forced (``force=True``) refresh fails
-    PERMANENTLY. The account is marked permanently failed and the request fails
-    over to another account. As with the proactive permanent branch, the failed
-    account's already-acquired stream lease must be released BEFORE the failover
-    ``continue`` so its stream-concurrency slot is not held for the entire
-    duration of the replacement stream.
+    The proactive freshness check succeeds so the stream opens; upstream then
+    revokes the token and the forced refresh fails permanently. The request is
+    an unanchored full resend, so retained reasoning makes its initially sent
+    body account-bound while a safe replay projection can omit that bookkeeping.
+    Failover must release both the stream lease and that provisional dispatch
+    owner before selecting the healthy account. Otherwise selection excludes
+    the revoked account while simultaneously requiring it and rewrites the
+    useful auth failure as ``preferred_account_unavailable``.
     """
     import json
 
@@ -1504,17 +1536,19 @@ async def test_proxy_post_401_permanent_refresh_releases_lease_before_failover(a
     monkeypatch.setattr(proxy_module.LoadBalancer, "release_account_lease", spy_release)
 
     streamed_account_ids: list[str] = []
+    streamed_inputs: list[object] = []
     released_before_failover_stream: list[str] = []
 
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
-        del payload, headers, access_token, base_url, raise_for_status, kwargs
+        del headers, access_token, base_url, raise_for_status, kwargs
+        streamed_inputs.append(payload.input)
         # First account opens then receives a 401 (triggering the forced
         # refresh that fails permanently). The failover account streams cleanly.
         if not streamed_account_ids:
             streamed_account_ids.append(account_id)
             raise proxy_module.ProxyResponseError(
                 401,
-                {"error": {"code": "invalid_api_key", "message": "token invalidated"}},
+                {"error": {"code": "token_revoked", "message": "token revoked"}},
             )
         released_before_failover_stream.extend(released_lease_account_ids)
         streamed_account_ids.append(account_id)
@@ -1528,7 +1562,7 @@ async def test_proxy_post_401_permanent_refresh_releases_lease_before_failover(a
     async with async_client.stream(
         "POST",
         "/backend-api/codex/responses",
-        json={"model": "gpt-5.4", "instructions": "hi", "input": [], "stream": True},
+        json={"model": "gpt-5.4", "instructions": "hi", "input": input_items, "stream": True},
     ) as resp:
         assert resp.status_code == 200
         lines = [line async for line in resp.aiter_lines() if line]
@@ -1542,6 +1576,18 @@ async def test_proxy_post_401_permanent_refresh_releases_lease_before_failover(a
     # permanently failed its forced refresh, then the failover account.
     assert len(set(streamed_account_ids)) == 2
     assert streamed_account_ids[0] != streamed_account_ids[-1]
+    if input_items:
+        assert [item.get("type", "message") for item in streamed_inputs[0]] == [
+            "message",
+            "reasoning",
+            "message",
+            "message",
+        ]
+        assert [item.get("type", "message") for item in streamed_inputs[-1]] == [
+            "message",
+            "message",
+            "message",
+        ]
     # The permanently-failed account's stream-concurrency lease was released
     # BEFORE the failover account started streaming (no leaked slot held for the
     # replacement stream's duration).

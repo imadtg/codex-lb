@@ -963,8 +963,22 @@ class _StreamingRetryMixin:
             )
             return True
 
-        def _move_previsible_quota_rejection_from_soft_owner(*, account_id: str, outcome: str) -> bool:
-            """Make a rejected full resend portable without crossing hard ownership."""
+        def _move_previsible_account_rejection_from_soft_owner(
+            *,
+            account_id: str,
+            outcome: str,
+            decision_stage: str = "quota_handoff",
+        ) -> bool:
+            """Make a rejected full resend portable without crossing hard ownership.
+
+            The dispatch anchor is provisional until upstream accepts the
+            request.  Once that account rejects the request before any output,
+            a client-supplied, unanchored full history may move only after the
+            ordinary replay projection proves the exact replacement body
+            account-neutral.  This applies equally to quota and permanently
+            revoked credentials; neither rejection creates response-owned
+            state on the failed account.
+            """
 
             nonlocal affinity, payload, payload_replay_required_account_id
             if (
@@ -986,9 +1000,9 @@ class _StreamingRetryMixin:
             payload = projected
             payload_replay_required_account_id = None
             affinity = replace(affinity, reallocate_sticky=True)
-            record_continuity_decision(stage="quota_handoff", reason="plaintext_replay_eligible")
+            record_continuity_decision(stage=decision_stage, reason="plaintext_replay_eligible")
             logger.info(
-                "previsible_quota_account_neutral_replay request_id=%s outcome=%s account_id=%s",
+                "previsible_account_rejection_account_neutral_replay request_id=%s outcome=%s account_id=%s",
                 request_id,
                 outcome,
                 account_id,
@@ -2688,7 +2702,7 @@ class _StreamingRetryMixin:
                                     and attempt < max_attempts - 1
                                     and classified["failure_class"] in ("rate_limit", "quota")
                                 ):
-                                    _move_previsible_quota_rejection_from_soft_owner(
+                                    _move_previsible_account_rejection_from_soft_owner(
                                         account_id=account.id,
                                         outcome="owner_previsible_quota_admission",
                                     )
@@ -2791,7 +2805,7 @@ class _StreamingRetryMixin:
                                         "rate_limit",
                                         "quota",
                                     ):
-                                        _move_previsible_quota_rejection_from_soft_owner(
+                                        _move_previsible_account_rejection_from_soft_owner(
                                             account_id=account.id,
                                             outcome="owner_previsible_quota_rejection",
                                         )
@@ -2954,7 +2968,7 @@ class _StreamingRetryMixin:
                         http_status=None,
                         phase="first_event",
                     )["failure_class"] in ("rate_limit", "quota"):
-                        _move_previsible_quota_rejection_from_soft_owner(
+                        _move_previsible_account_rejection_from_soft_owner(
                             account_id=account.id,
                             outcome="owner_previsible_retryable_quota_rejection",
                         )
@@ -3047,6 +3061,11 @@ class _StreamingRetryMixin:
                             if isinstance(refresh_exc, RefreshError):
                                 if refresh_exc.is_permanent:
                                     await proxy._load_balancer.mark_permanent_failure(account, refresh_exc.code)
+                                    _move_previsible_account_rejection_from_soft_owner(
+                                        account_id=account.id,
+                                        outcome="owner_post_401_permanent_auth_rejection",
+                                        decision_stage="account_handoff",
+                                    )
                                     # Keep the warning account routable for later
                                     # requests, but exclude it from this request's
                                     # retry pool after upstream rejected its token.
@@ -3435,7 +3454,7 @@ class _StreamingRetryMixin:
                                 and candidates_remaining > 0
                                 and classified["failure_class"] in ("rate_limit", "quota")
                             ):
-                                _move_previsible_quota_rejection_from_soft_owner(
+                                _move_previsible_account_rejection_from_soft_owner(
                                     account_id=account.id,
                                     outcome="owner_post_refresh_quota_admission",
                                 )
@@ -3537,7 +3556,7 @@ class _StreamingRetryMixin:
                                     "rate_limit",
                                     "quota",
                                 ):
-                                    _move_previsible_quota_rejection_from_soft_owner(
+                                    _move_previsible_account_rejection_from_soft_owner(
                                         account_id=account.id,
                                         outcome="owner_post_refresh_quota_rejection",
                                     )
