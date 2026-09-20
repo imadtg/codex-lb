@@ -741,6 +741,36 @@ class _PreviousResponseNotFoundUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
         )
 
 
+class _FirstSuccessThenPreviousResponseNotFoundUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    """Model a live bridge whose provider-side response anchor disappears."""
+
+    async def send_text(self, text: str) -> None:
+        if not self.sent_text:
+            await super().send_text(text)
+            return
+        self.sent_text.append(text)
+        payload = json.loads(text)
+        previous_response_id = payload.get("previous_response_id")
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "previous_response_not_found",
+                            "message": f"Previous response with id '{previous_response_id}' not found.",
+                            "param": "previous_response_id",
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
 class _PreviousResponseNotFoundAfterOutputUpstreamWebSocket(_PreviousResponseNotFoundUpstreamWebSocket):
     async def send_text(self, text: str) -> None:
         await self._messages.put(
@@ -14783,6 +14813,103 @@ async def test_v1_responses_http_bridge_rebinds_after_upstream_previous_response
     assert connect_count == 2
 
 
+@pytest.mark.asyncio
+async def test_backend_responses_stale_injected_anchor_replays_on_only_healthy_account(
+    async_client,
+    monkeypatch,
+):
+    """A verified fresh replay must not discard its only healthy account.
+
+    This is the externally observable restart/bridge-loss shape from production:
+    an earlier turn completed, the provider later rejects the proxy-injected
+    response anchor, and the client resends the complete conversation.  Account
+    selection and durable bridge state remain real; only the upstream WebSocket
+    boundary is simulated.
+    """
+
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_stale_anchor_only_healthy",
+        "http-bridge-stale-anchor-only-healthy@example.com",
+    )
+    account = await _get_account(account_id)
+    account_chatgpt_id = cast(str, account.chatgpt_account_id)
+    stale_upstream = _FirstSuccessThenPreviousResponseNotFoundUpstreamWebSocket("resp_stale_only")
+    recovered_upstream = _FakeBridgeUpstreamWebSocket("resp_recovered_only")
+    connected_account_ids: list[str] = []
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, base_url, session
+        connected_account_ids.append(account_id_header)
+        assert account_id_header == account_chatgpt_id
+        return stale_upstream if len(connected_account_ids) == 1 else recovered_upstream
+
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    headers = {"x-codex-session-id": "stale-anchor-only-healthy"}
+    historical_input = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first question"}],
+        }
+    ]
+    first_events = await _collect_sse_events(
+        async_client,
+        "/backend-api/codex/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": historical_input,
+            "stream": True,
+        },
+        headers=headers,
+    )
+    assert first_events[-1]["type"] == "response.completed"
+
+    full_resend = [
+        *historical_input,
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "OK"}],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "second question"}],
+        },
+    ]
+    second_events = await _collect_sse_events(
+        async_client,
+        "/backend-api/codex/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": full_resend,
+            "stream": True,
+        },
+        headers=headers,
+    )
+
+    assert second_events[-1]["type"] == "response.completed"
+    assert connected_account_ids == [account_chatgpt_id, account_chatgpt_id]
+    rejected_payload = json.loads(stale_upstream.sent_text[-1])
+    replayed_payload = json.loads(recovered_upstream.sent_text[-1])
+    assert rejected_payload.get("previous_response_id") is not None
+    assert "previous_response_id" not in replayed_payload
+    assert replayed_payload["input"] == full_resend
+
+
 @pytest.mark.parametrize(
     "replay_case",
     [
@@ -14895,7 +15022,11 @@ async def test_backend_responses_http_bridge_replays_verified_full_resend_after_
         selection_calls.append(dict(kwargs))
         preferred_account_id = cast(str | None, kwargs.get("preferred_account_id"))
         excluded_account_ids = cast(set[str], kwargs.get("exclude_account_ids") or set())
-        if owner_account.id in excluded_account_ids or preferred_account_id == alternate_account.id:
+        if (
+            owner_account.id in excluded_account_ids
+            or preferred_account_id == alternate_account.id
+            or (account_neutral and kwargs.get("request_stage") == "stale_anchor_recover")
+        ):
             return AccountSelection(account=alternate_account, error_message=None, error_code=None)
         return AccountSelection(account=owner_account, error_message=None, error_code=None)
 
@@ -15265,12 +15396,9 @@ async def test_backend_responses_http_bridge_replays_verified_full_resend_after_
             key.lower(): value for key, value in connect_headers_by_account[alternate_chatgpt_account_id].items()
         }
         assert not {"x-codex-session-id", "x-codex-turn-state"} & replay_connect_headers.keys()
-        replay_selection = next(
-            call
-            for call in selection_calls
-            if owner_account.id in cast(set[str], call.get("exclude_account_ids") or set())
-        )
+        replay_selection = next(call for call in selection_calls if call.get("request_stage") == "stale_anchor_recover")
         assert replay_selection.get("preferred_account_id") is None
+        assert owner_account.id not in cast(set[str], replay_selection.get("exclude_account_ids") or set())
     elif owner_bound_replay:
         assert second_events[-1]["response"]["id"] == "resp_stale_owner_2"
         assert connected_account_ids == [owner_chatgpt_account_id, owner_chatgpt_account_id]

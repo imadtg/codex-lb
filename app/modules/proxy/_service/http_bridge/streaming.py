@@ -2380,6 +2380,7 @@ class _HTTPBridgeStreamingMixin:
             event: str = "owner_unavailable_fresh_resend",
             detail: str = "outcome=projected_plaintext_full_resend_without_anchor",
             preserve_operation: bool = False,
+            exclude_failed_owner: bool = True,
         ) -> None:
             nonlocal account_neutral_recovery
             nonlocal affinity
@@ -2431,7 +2432,14 @@ class _HTTPBridgeStreamingMixin:
                 cache_key_family=bridge_session_key.affinity_kind,
                 model_class=_extract_model_class(payload.model) if payload.model else None,
             )
-            if failed_owner_id is not None:
+            # Removing a stale provider response anchor makes the replay
+            # independent of that anchor; it does not prove the account is
+            # unhealthy. Keep the account eligible for those replays so a
+            # single healthy-account pool cannot collapse into a synthetic
+            # usage/no-accounts error. Quota and owner-unavailable recovery
+            # still opt into exclusion because the account itself is the
+            # failed resource in those paths.
+            if exclude_failed_owner and failed_owner_id is not None:
                 fresh_replay_excluded_account_ids.add(failed_owner_id)
             session_creation_headers = without_http_bridge_session_affinity_headers(session_creation_headers)
             incoming_turn_state_header = None
@@ -2500,6 +2508,7 @@ class _HTTPBridgeStreamingMixin:
             switch_to_account_neutral_replay(
                 event="retired_anchor_fresh_resend",
                 detail="outcome=closed_predecessor_proof_retained",
+                exclude_failed_owner=False,
             )
 
         if (
@@ -3989,6 +3998,7 @@ class _HTTPBridgeStreamingMixin:
                     else "previous_response_recover_fresh_resend",
                     detail="outcome=explicit_rejection_account_neutral_replay",
                     preserve_operation=True,
+                    exclude_failed_owner=quota_rejected_full_resend,
                 )
                 recovery_path = "local_previous_response_fresh_replay"
                 retry_payload = effective_payload
