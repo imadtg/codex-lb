@@ -353,6 +353,7 @@ from app.modules.proxy._service.support import (
     _websocket_full_replay_should_wait_for_continuity,
     _WebSocketConnectFailureEmitted,
     _WebSocketContinuityState,
+    _WebSocketPermanentRefreshFailover,
     _WebSocketReceiveTimeout,
     _WebSocketRequestState,
     _WebSocketTransientRefreshFailover,
@@ -3788,31 +3789,38 @@ class _WebSocketMixin:
                     # (require_preferred_account) still stay on their account.
                     can_transient_failover=not require_preferred_account,
                 )
-            except _WebSocketTransientRefreshFailover as failover:
-                # A transient, transport-level refresh failure (e.g. the
-                # account's refresh claim is held by another replica) reached
-                # the connect path. Release the skipped account's already-
-                # acquired stream lease so it does not keep consuming a
-                # stream-concurrency slot for a connection that never opens,
-                # exclude it, and reselect a healthy account.
+            except (_WebSocketTransientRefreshFailover, _WebSocketPermanentRefreshFailover) as failover:
+                # Refresh proved this selected account cannot serve the
+                # pre-dispatch request. Release its already-acquired stream
+                # lease, exclude it, and reselect another account. Permanent
+                # failures have already been persisted by the attempt; benign
+                # cross-replica refresh contention remains unpenalized.
                 await proxy._load_balancer.release_account_lease(selected_stream_lease)
                 selected_stream_lease = None
-                # Record a capacity-style failure so that if every account
-                # attempt hits a transient refresh-claim failover, the loop
-                # still surfaces a proper terminal error after exhaustion
-                # instead of returning (None, None) silently. The account
-                # credentials are fine (its refresh claim is just held by
-                # another replica), so this must be a 503/capacity-style
-                # upstream error, NOT a bogus 401 invalid_api_key.
-                refresh_failure = ProxyResponseError(
-                    503,
-                    openai_error(
-                        "upstream_unavailable",
-                        "Account refresh is temporarily unavailable; no healthy account could be reached.",
-                        error_type="server_error",
-                    ),
-                )
+                if isinstance(failover, _WebSocketPermanentRefreshFailover):
+                    refresh_failure = ProxyResponseError(
+                        401,
+                        openai_error(
+                            "invalid_api_key",
+                            failover.message,
+                            error_type="authentication_error",
+                        ),
+                    )
+                else:
+                    # Preserve a retryable pool-level error if every account
+                    # is only blocked by transient refresh contention.
+                    refresh_failure = ProxyResponseError(
+                        503,
+                        openai_error(
+                            "upstream_unavailable",
+                            "Account refresh is temporarily unavailable; no healthy account could be reached.",
+                            error_type="server_error",
+                        ),
+                    )
                 if selected_account_model_replacement:
+                    refresh_error = refresh_failure.payload.get("error", {})
+                    refresh_error_code = str(refresh_error.get("code") or "upstream_unavailable")
+                    refresh_error_message = str(refresh_error.get("message") or failover)
                     await proxy._emit_websocket_connect_failure(
                         websocket,
                         client_send_lock=client_send_lock,
@@ -3821,10 +3829,8 @@ class _WebSocketMixin:
                         request_state=request_state,
                         status_code=refresh_failure.status_code,
                         payload=refresh_failure.payload,
-                        error_code="upstream_unavailable",
-                        error_message=(
-                            "Account refresh is temporarily unavailable; no healthy account could be reached."
-                        ),
+                        error_code=refresh_error_code,
+                        error_message=refresh_error_message,
                     )
                     return None, None
                 excluded_account_ids.add(failover.account_id)
@@ -4368,6 +4374,8 @@ class _WebSocketMixin:
         except RefreshError as exc:
             if exc.is_permanent:
                 await proxy._load_balancer.mark_permanent_failure(account, exc.code)
+                if can_transient_failover:
+                    raise _WebSocketPermanentRefreshFailover(account.id, exc.message) from exc
             elif can_transient_failover and is_transient_refresh_contention(exc):
                 # Transient CROSS-REPLICA refresh contention on the proactive
                 # freshness check: benign claim contention (the account's refresh
@@ -4492,6 +4500,8 @@ class _WebSocketMixin:
         except RefreshError as refresh_exc:
             if refresh_exc.is_permanent:
                 await proxy._load_balancer.mark_permanent_failure(account, refresh_exc.code)
+                if can_transient_failover:
+                    raise _WebSocketPermanentRefreshFailover(account.id, refresh_exc.message) from refresh_exc
             elif can_transient_failover and is_transient_refresh_contention(refresh_exc):
                 # Transient CROSS-REPLICA refresh contention on the post-401 forced
                 # refresh: benign claim contention (the account's refresh claim is

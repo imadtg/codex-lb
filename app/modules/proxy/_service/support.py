@@ -699,6 +699,21 @@ class _WebSocketTransientRefreshFailover(Exception):
         self.account_id = account_id
 
 
+class _WebSocketPermanentRefreshFailover(Exception):
+    """Signals safe failover after a selected account cannot refresh again.
+
+    The refresh failure has already been persisted as permanent.  This signal
+    is only used before a movable WebSocket request reaches upstream, so the
+    connect loop may release the dead account's lease, exclude it, and select
+    another account without exposing a terminal credential error for the pool.
+    """
+
+    def __init__(self, account_id: str, message: str) -> None:
+        super().__init__(account_id)
+        self.account_id = account_id
+        self.message = message
+
+
 # ---- Refresh-claim contention failover helpers -----------------------------
 #
 # A transient cross-replica refresh contention (``is_transient_refresh_contention``:

@@ -1966,6 +1966,149 @@ def test_backend_responses_websocket_transient_refresh_claim_fails_over_instead_
     assert permanent_failures == []
 
 
+@pytest.mark.parametrize("failure_phase", ["preflight", "post_401"])
+def test_backend_responses_websocket_permanent_refresh_fails_over(
+    app_instance,
+    monkeypatch,
+    failure_phase,
+):
+    """A fresh movable WebSocket request must skip permanently dead credentials.
+
+    This is the WebSocket counterpart of the HTTP streaming regression in
+    ``test_proxy_preflight_permanent_refresh_releases_lease_before_failover``.
+    A selected account can become permanently unrefreshable after selection
+    (or remain temporarily routable while ``reauth_required``).  That account
+    must be marked, excluded, and have its stream lease released before the
+    same fresh request is admitted on another healthy account.
+    """
+    recovered_upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.created",
+                            "response": {"id": "resp_ws_permanent_refresh_recovered", "status": "in_progress"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {"id": "resp_ws_permanent_refresh_recovered", "status": "completed"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+            ]
+        ],
+    )
+    first_seen: dict[str, str | None] = {"account_id": None}
+    opened_accounts: list[str] = []
+    released_lease_account_ids: list[str | None] = []
+    released_before_open: list[str | None] = []
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fake_ensure_fresh(self, account, *, force=False, timeout_seconds=None):
+        del self, timeout_seconds
+        if first_seen["account_id"] is None:
+            first_seen["account_id"] = account.id
+        permanent_now = (failure_phase == "preflight" and not force) or (failure_phase == "post_401" and force)
+        if account.id == first_seen["account_id"] and permanent_now:
+            raise RefreshError("refresh_token_reused", "refresh token reused", True)
+        return account
+
+    async def fake_open_upstream_with_budget(self, account, headers, *, timeout_seconds, request_state=None):
+        del self, headers, timeout_seconds, request_state
+        if failure_phase == "post_401" and account.id == first_seen["account_id"]:
+            raise proxy_module.ProxyResponseError(
+                401,
+                proxy_module.openai_error(
+                    "invalid_api_key",
+                    "token invalidated",
+                    error_type="authentication_error",
+                ),
+            )
+        released_before_open.extend(released_lease_account_ids)
+        opened_accounts.append(account.id)
+        return recovered_upstream
+
+    original_release = proxy_module.LoadBalancer.release_account_lease
+
+    async def spy_release_account_lease(self, lease):
+        if lease is not None and lease.kind == "stream":
+            released_lease_account_ids.append(lease.account_id)
+        return await original_release(self, lease)
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_open_upstream_websocket_with_budget",
+        fake_open_upstream_with_budget,
+    )
+    monkeypatch.setattr(proxy_module.LoadBalancer, "release_account_lease", spy_release_account_lease)
+
+    async def seed_accounts() -> None:
+        async with SessionLocal() as session:
+            for account_id in ("acct_ws_permanent_a", "acct_ws_permanent_b"):
+                session.add(
+                    Account(
+                        id=account_id,
+                        chatgpt_account_id=account_id,
+                        email=f"{account_id}@example.com",
+                        plan_type="plus",
+                        access_token_encrypted=b"access",
+                        refresh_token_encrypted=b"refresh",
+                        id_token_encrypted=b"id",
+                        last_refresh=proxy_module.utcnow(),
+                        status=AccountStatus.ACTIVE,
+                    )
+                )
+            await session.commit()
+
+    asyncio.run(seed_accounts())
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.4",
+                        "input": "hello",
+                        "stream": True,
+                    }
+                )
+            )
+            created = json.loads(websocket.receive_text())
+            completed = json.loads(websocket.receive_text()) if created.get("type") == "response.created" else {}
+
+    failed_account_id = first_seen["account_id"]
+    assert failed_account_id is not None
+    assert created["type"] == "response.created"
+    assert completed["type"] == "response.completed"
+    assert completed["response"]["id"] == "resp_ws_permanent_refresh_recovered"
+    assert len(opened_accounts) == 1 and failed_account_id not in opened_accounts
+    assert failed_account_id in released_before_open
+
+
 def test_backend_responses_websocket_genuine_transport_error_penalizes_and_fails_over(
     app_instance,
     monkeypatch,
