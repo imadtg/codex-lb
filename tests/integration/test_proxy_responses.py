@@ -726,7 +726,7 @@ async def test_proxy_responses_revoked_access_token_fails_over_once_and_is_never
     monkeypatch.setattr(proxy_module, "_STREAM_MAX_ACCOUNT_ATTEMPTS", 2)
 
     first_payload = {
-        "model": "gpt-5.6-sol",
+        "model": "gpt-5.6-luna",
         "instructions": "hi",
         "input": [
             {"type": "message", "role": "user", "content": "first question"},
@@ -735,6 +735,35 @@ async def test_proxy_responses_revoked_access_token_fails_over_once_and_is_never
                 "id": "rs_revoked_owner",
                 "encrypted_content": "opaque-state",
                 "summary": [],
+            },
+            {
+                "type": "tool_search_call",
+                "id": "tsc_revoked_owner",
+                "call_id": "call_search_revoked_owner",
+                "execution": "client",
+                "status": "completed",
+                "arguments": {"query": "retained tool"},
+            },
+            {
+                "type": "tool_search_output",
+                "id": "tso_revoked_owner",
+                "call_id": "call_search_revoked_owner",
+                "execution": "client",
+                "status": "completed",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "retained_tool",
+                        "description": "Useful deferred context",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+            {
+                "type": "web_search_call",
+                "id": "wsc_revoked_owner",
+                "status": "completed",
+                "action": {"type": "search", "query": "retained fact"},
             },
             {
                 "type": "message",
@@ -758,14 +787,23 @@ async def test_proxy_responses_revoked_access_token_fails_over_once_and_is_never
     assert upstream_attempts[0] == revoked_upstream_account_id
     assert upstream_attempts[1] != revoked_upstream_account_id
     assert len(upstream_payloads) == 2
-    replay_input = upstream_payloads[1].input
-    assert isinstance(replay_input, list)
-    assert all(not isinstance(item, dict) or item.get("type") != "reasoning" for item in replay_input)
-    assert all(not isinstance(item, dict) or "id" not in item for item in replay_input)
+    # Pre-execution credential rejection releases only the provisional owner.
+    # Source-minted top-level IDs are unlinked; every context-bearing item and
+    # all of its other fields must survive. Omitting reasoning or search state
+    # makes this public-route regression fail.
+    expected_replay_input = [
+        {key: value for key, value in item.items() if key != "id"} for item in first_payload["input"]
+    ]
+    first_wire_payload = upstream_payloads[0].model_dump(mode="json", exclude_none=True)
+    expected_wire_payload = {**first_wire_payload, "input": expected_replay_input}
+    assert upstream_payloads[1].model_dump(mode="json", exclude_none=True) == expected_wire_payload
+    assert [item.get("type") for item in upstream_payloads[1].input] == [
+        item.get("type") for item in first_payload["input"]
+    ]
 
     attempts_after_first_request = len(upstream_attempts)
     second_payload = {
-        "model": "gpt-5.6-sol",
+        "model": "gpt-5.6-luna",
         "instructions": "new turn",
         "input": [{"type": "message", "role": "user", "content": "fresh request"}],
         "stream": True,

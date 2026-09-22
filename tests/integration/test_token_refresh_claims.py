@@ -1481,10 +1481,11 @@ async def test_proxy_post_401_permanent_refresh_releases_lease_and_portable_hist
     The proactive freshness check succeeds so the stream opens; upstream then
     revokes the token and the forced refresh fails permanently. The request is
     an unanchored full resend, so retained reasoning makes its initially sent
-    body account-bound while a safe replay projection can omit that bookkeeping.
-    Failover must release both the stream lease and that provisional dispatch
-    owner before selecting the healthy account. Otherwise selection excludes
-    the revoked account while simultaneously requiring it and rewrites the
+    body account-bound while the handoff unlinks only source-minted item IDs.
+    Failover must preserve retained reasoning, release both the stream lease
+    and that provisional dispatch owner, then select the healthy account.
+    Otherwise selection excludes the revoked account while simultaneously
+    requiring it and rewrites the
     useful auth failure as ``preferred_account_unavailable``.
     """
     import json
@@ -1548,7 +1549,7 @@ async def test_proxy_post_401_permanent_refresh_releases_lease_and_portable_hist
             streamed_account_ids.append(account_id)
             raise proxy_module.ProxyResponseError(
                 401,
-                {"error": {"code": "token_revoked", "message": "token revoked"}},
+                {"error": {"code": "unauthorized", "message": "access token rejected"}},
             )
         released_before_failover_stream.extend(released_lease_account_ids)
         streamed_account_ids.append(account_id)
@@ -1562,7 +1563,7 @@ async def test_proxy_post_401_permanent_refresh_releases_lease_and_portable_hist
     async with async_client.stream(
         "POST",
         "/backend-api/codex/responses",
-        json={"model": "gpt-5.4", "instructions": "hi", "input": input_items, "stream": True},
+        json={"model": "gpt-5.6-luna", "instructions": "hi", "input": input_items, "stream": True},
     ) as resp:
         assert resp.status_code == 200
         lines = [line async for line in resp.aiter_lines() if line]
@@ -1571,7 +1572,7 @@ async def test_proxy_post_401_permanent_refresh_releases_lease_and_portable_hist
     assert any(event.get("type") == "response.completed" for event in events)
 
     failed_account_id = first_forced["account_id"]
-    assert failed_account_id is not None
+    assert failed_account_id is not None, (events, streamed_account_ids)
     # Two distinct accounts streamed: the one that opened, took the 401, and
     # permanently failed its forced refresh, then the failover account.
     assert len(set(streamed_account_ids)) == 2
@@ -1583,10 +1584,8 @@ async def test_proxy_post_401_permanent_refresh_releases_lease_and_portable_hist
             "message",
             "message",
         ]
-        assert [item.get("type", "message") for item in streamed_inputs[-1]] == [
-            "message",
-            "message",
-            "message",
+        assert streamed_inputs[-1] == [
+            {key: value for key, value in item.items() if key != "id"} for item in input_items
         ]
     # The permanently-failed account's stream-concurrency lease was released
     # BEFORE the failover account started streaming (no leaked slot held for the

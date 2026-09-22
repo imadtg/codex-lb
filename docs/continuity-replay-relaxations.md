@@ -16,7 +16,7 @@ The detailed beta.8 comparison and source ledger remain in
 | Codex namespace declarations and call identity can survive account handoff | Nested tools are recursively validated; provider projection remains separately closed | Codex source plus disposable public-process scenarios |
 | The exact host `codex_app.automation_update` heartbeat can act as fresh input | Exact field set, heartbeat XML shape, finite timestamp, and no unsettled call | Upstream maintainer review evidence plus malformed-shape controls |
 | Encrypted collaboration `agent_message` delivery can move between ChatGPT accounts | Exactly `[input_text envelope, encrypted_content]`; ciphertext is nonblank and preserved verbatim; all response-owned item IDs and the old response anchor are removed | Direct OpenAI valid/corrupt experiment, Codex source, helper tests, and an HTTP-bridge regression |
-| A pre-visible permanent credential rejection releases a soft dispatch owner | Only an unanchored full resend may move, and only after the existing projection produces an account-neutral replacement body; previous-response, turn-state, and file owners remain strict | Read-only production trace reduction plus a public-route integration regression |
+| A pre-visible permanent credential rejection releases a soft dispatch owner | Only an unanchored full resend may move; the handoff unlinks top-level source item IDs but preserves reasoning, search records, tool outputs, and nested values; previous-response, turn-state, and file owners remain strict | Read-only production trace reduction, two Free-to-Free Luna repetitions, and public-route regressions |
 
 The first five allowances landed earlier in this fork. Commit `bdf3e5ef` adds
 the encrypted collaboration allowance. This ledger should gain a row whenever
@@ -34,24 +34,58 @@ place. Selection therefore required and excluded the same account and replaced
 the useful auth failure with `preferred_account_unavailable`, even though other
 accounts were serving the same model.
 
-Commit `c90f5d10` applies the same fail-closed replay projection already used
-for pre-visible quota rejection when a post-401 forced refresh fails
-permanently. If projection succeeds, response-owned bookkeeping such as
-retained reasoning is omitted and the unanchored client history moves to the
-next account. If projection fails, the dispatch owner remains strict. The
-change cannot release previous-response, turn-state, file, or single-account
-ownership.
+The earlier implementation applied the same replay projection used for quota
+handoff when a post-401 forced refresh failed permanently. That projection
+omitted reasoning and completed search records. This fork now releases only
+the provisional owner and unlinks top-level source item IDs; it sends the full
+parsed history, including reasoning ciphertext and completed search records,
+to the replacement account. If the request has previous-response, turn-state,
+file, or single-account ownership, the owner remains strict.
 
 The route-level regression
 `test_proxy_post_401_permanent_refresh_releases_lease_and_portable_history`
 recreates the production sequence through `/backend-api/codex/responses`: the
 first upstream account returns `token_revoked`, its forced refresh fails
-permanently, and a second eligible account receives the projected history and
-completes. On the preceding commit, the compacted-history case ends with
-`preferred_account_unavailable`; on `c90f5d10`, it completes on the alternate.
-The trace now records `stage=account_handoff`,
-`reason=plaintext_replay_eligible`, and outcome
-`owner_post_401_permanent_auth_rejection` when this release occurs.
+permanently, and a second eligible account receives the ID-unlinked full
+history and completes. The regression asserts that reasoning, tool-search,
+web-search, messages, and all nested fields survive the handoff.
+
+## Context portability experiment
+
+On 2026-09-22, a disposable direct-OpenAI probe ran twice between two active
+Free accounts using `gpt-5.6-luna` and client version `0.156.0`. Every request
+used `store: false`, omitted `previous_response_id`, and bypassed codex-lb.
+The source and target IDs were hashed before the result was written.
+
+The experiment separately tested hidden reasoning state, web-search history,
+and client tool-search history. It compared same-account controls with full
+cross-account history, ID-only unlinking, and individual item omission.
+
+The stable findings were:
+
+- Full tool-search history and ID-only unlinking recovered the exact opaque
+  deferred-tool marker in both repetitions. Omitting `tool_search_call` and
+  `tool_search_output` failed in both repetitions.
+- Web-search continuation changed when history was moved across accounts in
+  both repetitions, and omitting `web_search_call` also changed it. ID-only
+  unlinking preserved the same-account answer in one run but not the other,
+  showing that web results and model sampling can vary. The search record
+  remains useful context and must not be dropped.
+- Hidden reasoning ciphertext was accepted by the target in both repetitions;
+  corrupting one character returned `invalid_encrypted_content`. The exact
+  hidden-string continuation was stochastic: full cross-account replay matched
+  the same-account control once and diverged once. Omitting reasoning also
+  diverged once and matched once. This does not justify deleting the
+  ciphertext. It proves that the backend consumes and validates it, while the
+  model's hidden-state continuation is not deterministic across these runs.
+
+The redacted machine-readable evidence is
+[`docs/evidence/cross-account-context-portability-2026-09-22.json`](evidence/cross-account-context-portability-2026-09-22.json).
+The rerunnable probe is
+[`scripts/probe_cross_account_context_portability.py`](../scripts/probe_cross_account_context_portability.py).
+It requires four environment variables for disposable source and target
+credentials, never reads the codex-lb database, and records no raw model text,
+tokens, ciphertext, or account IDs.
 
 ## Encrypted collaboration experiment
 

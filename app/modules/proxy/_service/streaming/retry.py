@@ -114,8 +114,8 @@ from app.modules.proxy.http_continuation import http_continuation_signal
 from app.modules.proxy.load_balancer import AccountLease, AccountSelection
 from app.modules.proxy.replay_safety import (
     project_unanchored_account_neutral_input,
-    project_unanchored_plaintext_history,
     responses_payload_is_account_neutral_fresh_replay,
+    strip_input_item_ids,
 )
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
 
@@ -972,15 +972,16 @@ class _StreamingRetryMixin:
             outcome: str,
             decision_stage: str = "quota_handoff",
         ) -> bool:
-            """Make a rejected full resend portable without crossing hard ownership.
+            """Release a rejected soft owner without rewriting caller history.
 
             The dispatch anchor is provisional until upstream accepts the
             request.  Once that account rejects the request before any output,
-            a client-supplied, unanchored full history may move only after the
-            ordinary replay projection proves the exact replacement body
-            account-neutral.  This applies equally to quota and permanently
-            revoked credentials; neither rejection creates response-owned
-            state on the failed account.
+            the exact unanchored request may move to another account. This
+            applies equally to quota and permanently revoked credentials;
+            neither rejection creates response-owned state on the failed
+            account. Retained reasoning and search bookkeeping are model
+            context, so this path must never omit or reconstruct them. Only
+            source-minted top-level item IDs are unlinked before handoff.
             """
 
             nonlocal affinity, payload, payload_replay_required_account_id
@@ -992,20 +993,13 @@ class _StreamingRetryMixin:
                 or routing_strategy == "single_account"
             ):
                 return False
-            normalized_input = project_unanchored_plaintext_history(payload.to_replay_safety_payload())
-            projected = (
-                payload.model_copy(update={"input": normalized_input})
-                if normalized_input is not None
-                else _project_unanchored_account_neutral_replay(payload)
-            )
-            if projected is None:
-                return False
-            payload = projected
+            if isinstance(payload.input, list):
+                payload = payload.model_copy(update={"input": strip_input_item_ids(payload.input)})
             payload_replay_required_account_id = None
             affinity = replace(affinity, reallocate_sticky=True)
-            record_continuity_decision(stage=decision_stage, reason="plaintext_replay_eligible")
+            record_continuity_decision(stage=decision_stage, reason="context_preserving_replay_eligible")
             logger.info(
-                "previsible_account_rejection_account_neutral_replay request_id=%s outcome=%s account_id=%s",
+                "previsible_account_rejection_context_preserving_replay request_id=%s outcome=%s account_id=%s",
                 request_id,
                 outcome,
                 account_id,
@@ -1021,8 +1015,11 @@ class _StreamingRetryMixin:
             the dispatch account is recorded as the provisional payload owner.
             Permanent account-local failures (revoked credentials, deactivated
             accounts, and similar authentication failures) prove that no turn
-            was created, so an unanchored body may be projected and retried on a
-            different eligible account.  Hard continuity owners remain pinned.
+            was created, so the exact unanchored body may be retried on a
+            different eligible account. Hard continuity owners remain pinned.
+            Caller history is preserved at the parsed JSON level apart from
+            unlinking source-minted top-level item IDs: reasoning, search
+            records, and every nested value remain model context.
             """
 
             nonlocal affinity, payload, payload_replay_required_account_id, preferred_account_id
@@ -1037,26 +1034,8 @@ class _StreamingRetryMixin:
             ):
                 return False
 
-            replay_payload = payload
-            if not responses_payload_is_account_neutral_fresh_replay(
-                replay_payload.to_replay_safety_payload()
-            ):
-                normalized_input = project_unanchored_plaintext_history(
-                    replay_payload.to_replay_safety_payload()
-                )
-                if normalized_input is None:
-                    normalized_input = project_unanchored_account_neutral_input(
-                        replay_payload.to_replay_safety_payload()
-                    )
-                if normalized_input is None:
-                    return False
-                replay_payload = replay_payload.model_copy(update={"input": normalized_input})
-                if not responses_payload_is_account_neutral_fresh_replay(
-                    replay_payload.to_replay_safety_payload()
-                ):
-                    return False
-
-            payload = replay_payload
+            if isinstance(payload.input, list):
+                payload = payload.model_copy(update={"input": strip_input_item_ids(payload.input)})
             payload_replay_required_account_id = None
             excluded_account_ids.add(account_id)
             if preferred_account_id == account_id:

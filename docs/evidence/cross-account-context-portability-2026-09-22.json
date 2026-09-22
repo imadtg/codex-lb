@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-22",
+  "endpoint": "https://chatgpt.com/backend-api/codex/responses",
+  "model": "gpt-5.6-luna",
+  "client_version": "0.156.0",
+  "account_relation": "two active Free accounts; identifiers omitted",
+  "request_invariants": {"store": false, "previous_response_id": false, "via_codex_lb": false},
+  "repetitions": 2,
+  "results": {
+    "reasoning": {
+      "same_account_control_completed": 2,
+      "cross_account_full_completed": 2,
+      "cross_account_corrupt_reasoning_invalid_encrypted_content": 2,
+      "full_cross_account_matches_control": [false, true],
+      "id_only_matches_control": [false, true],
+      "omit_reasoning_matches_control": [false, true]
+    },
+    "tool_search": {
+      "same_account_exact_marker": 2,
+      "cross_account_full_exact_marker": 2,
+      "cross_account_id_only_exact_marker": 2,
+      "cross_account_omit_reasoning_exact_marker": 2,
+      "cross_account_omit_tool_search_exact_marker": 0
+    },
+    "web_search": {
+      "same_account_control_completed": 2,
+      "cross_account_full_matches_control": [false, false],
+      "cross_account_id_only_matches_control": [false, true],
+      "cross_account_omit_reasoning_matches_control": [false, false],
+      "cross_account_omit_web_search_matches_control": [false, false]
+    }
+  },
+  "privacy": {
+    "contains_access_token": false,
+    "contains_raw_model_text": false,
+    "contains_ciphertext": false,
+    "contains_account_identifier": false,
+    "contains_database_record": false
+  }
+}
