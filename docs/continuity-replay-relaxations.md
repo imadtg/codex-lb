@@ -73,14 +73,19 @@ The stable findings were:
   remains useful context and must not be dropped.
 - Hidden reasoning ciphertext was accepted by the target in both repetitions;
   corrupting one character returned `invalid_encrypted_content`. The exact
-  hidden-string continuation was stochastic: full cross-account replay matched
-  the same-account control once and diverged once. Omitting reasoning also
-  diverged once and matched once. This does not justify deleting the
-  ciphertext. It proves that the backend consumes and validates it, while the
-  model's hidden-state continuation is not deterministic across these runs.
+  hidden-string continuation was stochastic. In a six-history run, full
+  cross-account replay matched the one same-account control once. A tighter
+  follow-up asked the source and target three times each for two retained
+  histories: every target output matched one of the source outputs, while one
+  source history itself produced two different outputs. This separates model
+  sampling from ciphertext handling. It still does not prove cryptographic
+  hidden-state equality, but it does prove that omission is not an equivalent
+  context and gives no reason to delete the ciphertext.
 
 The redacted machine-readable evidence is
 [`docs/evidence/cross-account-context-portability-2026-09-22.json`](evidence/cross-account-context-portability-2026-09-22.json).
+The repeated reasoning controls are recorded in
+[`docs/evidence/cross-account-reasoning-repeatability-2026-09-22.json`](evidence/cross-account-reasoning-repeatability-2026-09-22.json).
 The rerunnable probe is
 [`scripts/probe_cross_account_context_portability.py`](../scripts/probe_cross_account_context_portability.py).
 It requires four environment variables for disposable source and target

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-22",
+  "endpoint": "https://chatgpt.com/backend-api/codex/responses",
+  "model": "gpt-5.6-luna",
+  "client_version": "0.156.0",
+  "account_relation": "two active Free accounts; identifiers omitted",
+  "request_invariants": {
+    "store": false,
+    "previous_response_id": false,
+    "via_codex_lb": false
+  },
+  "six_independent_histories": {
+    "same_account_completed": 6,
+    "cross_account_full_completed": 6,
+    "full_cross_account_exact_control_matches": 1,
+    "id_only_exact_control_matches": 1,
+    "omit_reasoning_exact_control_matches": 1,
+    "corrupted_reasoning_invalid_encrypted_content": 6
+  },
+  "repeated_continuations_of_two_histories": {
+    "source_continuations_per_history": 3,
+    "target_continuations_per_history": 3,
+    "history_one": {
+      "source_unique_outputs": 2,
+      "target_unique_outputs": 1,
+      "every_target_output_matched_one_source_output": true
+    },
+    "history_two": {
+      "source_unique_outputs": 1,
+      "target_unique_outputs": 1,
+      "every_target_output_matched_one_source_output": true
+    }
+  },
+  "interpretation": {
+    "ciphertext_accepted_cross_account": true,
+    "ciphertext_integrity_checked": true,
+    "exact_hidden_state_equality_proven": false,
+    "reasoning_must_be_preserved": true,
+    "reasoning_equality_limit": "The model samples continuation text; exact output equality is not a cryptographic decryption oracle. The target repeatedly produced outputs also produced by the source from the same retained item, while omission is not equivalent context."
+  },
+  "privacy": {
+    "contains_access_token": false,
+    "contains_raw_model_text": false,
+    "contains_ciphertext": false,
+    "contains_account_identifier": false,
+    "contains_database_record": false
+  }
+}
