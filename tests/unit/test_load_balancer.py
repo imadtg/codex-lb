@@ -2226,6 +2226,22 @@ def test_bypass_quota_exceeded_keeps_reauth_request_routable():
     assert result.account.account_id == "r"
 
 
+def test_revoked_access_token_reason_blocks_even_before_status_settles():
+    """A peer must honor the durable quarantine written before stream settlement."""
+    revoked = AccountState(
+        "revoked",
+        AccountStatus.ACTIVE,
+        used_percent=0.0,
+        deactivation_reason="Authentication token revoked - re-login required",
+    )
+    healthy = AccountState("healthy", AccountStatus.ACTIVE, used_percent=0.0)
+
+    result = select_account([revoked, healthy], now=1_700_000_000.0)
+
+    assert result.account is not None
+    assert result.account.account_id == "healthy"
+
+
 def _make_test_account(
     account_id: str = "a",
     status: AccountStatus = AccountStatus.ACTIVE,

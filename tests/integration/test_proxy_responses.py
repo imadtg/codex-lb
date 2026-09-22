@@ -17,13 +17,16 @@ import app.modules.proxy.api as proxy_api_module
 import app.modules.proxy.downstream_delivery as downstream_delivery_module
 import app.modules.proxy.service as proxy_module
 from app.core.auth import generate_unique_account_id
+from app.core.clients.proxy import ProxyResponseError
 from app.core.config.settings import Settings
+from app.core.errors import openai_error
 from app.core.http_protocol import HTTP_DISCONNECTED_STATE
+from app.core.openai.model_registry import get_model_registry
 from app.core.openai.models import CompactResponsePayload
 from app.core.openai.requests import ResponsesRequest
 from app.core.types import JsonValue
 from app.core.utils.time import utcnow
-from app.db.models import Account, DashboardSettings, RequestLog, StickySessionKind
+from app.db.models import Account, AccountStatus, DashboardSettings, RequestLog, StickySessionKind
 from app.db.session import SessionLocal
 from app.modules.api_keys.service import ApiKeyUsageReservationData
 from app.modules.proxy._service.streaming import retry as streaming_retry_module
@@ -664,6 +667,264 @@ async def test_proxy_responses_repeated_401_after_refresh_fails_over(async_clien
     assert event["response"]["id"] == "resp_stream_failover"
     assert captured_account_ids[0] == invalidated_account_id
     assert captured_account_ids[1] != invalidated_account_id
+
+
+@pytest.mark.asyncio
+async def test_proxy_responses_revoked_access_token_fails_over_once_and_is_never_selected_again(
+    async_client, monkeypatch
+):
+    """A real pre-visible ``token_revoked`` response retires that credential.
+
+    This is the process-level shape observed in production: two otherwise
+    eligible Plus accounts, one access token that OpenAI has revoked before its
+    JWT expiry, and a fresh replayable Codex turn.  The request must finish on
+    the healthy account, and a later fresh request must not spend another
+    upstream attempt rediscovering the same revoked credential.
+    """
+    imported_account_ids: list[str] = []
+    for suffix in ("a", "b"):
+        raw_account_id = f"acc_process_token_revoked_{suffix}"
+        email = f"process-token-revoked-{suffix}@example.com"
+        response = await async_client.post(
+            "/api/accounts/import",
+            files={
+                "auth_json": (
+                    f"auth-{suffix}.json",
+                    json.dumps(_make_auth_json(raw_account_id, email)),
+                    "application/json",
+                )
+            },
+        )
+        assert response.status_code == 200
+        imported_account_ids.append(generate_unique_account_id(raw_account_id, email))
+
+    upstream_attempts: list[str | None] = []
+    upstream_payloads: list[ResponsesRequest] = []
+    revoked_upstream_account_id: str | None = None
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
+        del headers, access_token, base_url, raise_for_status, kwargs
+        nonlocal revoked_upstream_account_id
+        if revoked_upstream_account_id is None:
+            revoked_upstream_account_id = account_id
+        upstream_attempts.append(account_id)
+        upstream_payloads.append(payload)
+        if account_id == revoked_upstream_account_id:
+            yield (
+                'data: {"type":"response.failed","sequence_number":2,'
+                '"response":{"id":"resp_token_revoked","status":"failed",'
+                '"error":{"code":"token_revoked","type":"authentication_error",'
+                '"message":"Encountered invalidated oauth token for user, failing request"}}}\n\n'
+            )
+            return
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_token_revoked_failover",'
+            '"object":"response","status":"completed","usage":{"input_tokens":2,"output_tokens":1}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    monkeypatch.setattr(proxy_module, "_STREAM_MAX_ACCOUNT_ATTEMPTS", 2)
+
+    first_payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "hi",
+        "input": [
+            {"type": "message", "role": "user", "content": "first question"},
+            {
+                "type": "reasoning",
+                "id": "rs_revoked_owner",
+                "encrypted_content": "opaque-state",
+                "summary": [],
+            },
+            {
+                "type": "message",
+                "id": "msg_revoked_owner",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "prior answer"}],
+            },
+            {"type": "message", "role": "user", "content": "continue"},
+        ],
+        "stream": True,
+        "prompt_cache_key": "process-token-revoked-first",
+    }
+    async with async_client.stream("POST", "/backend-api/codex/responses", json=first_payload) as response:
+        assert response.status_code == 200
+        first_lines = [line async for line in response.aiter_lines() if line]
+
+    first_event = _extract_first_event(first_lines)
+    assert first_event["type"] == "response.completed", (first_event, upstream_attempts)
+    assert first_event["response"]["id"] == "resp_token_revoked_failover"
+    assert upstream_attempts[0] == revoked_upstream_account_id
+    assert upstream_attempts[1] != revoked_upstream_account_id
+    assert len(upstream_payloads) == 2
+    replay_input = upstream_payloads[1].input
+    assert isinstance(replay_input, list)
+    assert all(not isinstance(item, dict) or item.get("type") != "reasoning" for item in replay_input)
+    assert all(not isinstance(item, dict) or "id" not in item for item in replay_input)
+
+    attempts_after_first_request = len(upstream_attempts)
+    second_payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "new turn",
+        "input": [{"type": "message", "role": "user", "content": "fresh request"}],
+        "stream": True,
+        "prompt_cache_key": "process-token-revoked-second",
+    }
+    async with async_client.stream("POST", "/backend-api/codex/responses", json=second_payload) as response:
+        assert response.status_code == 200
+        second_lines = [line async for line in response.aiter_lines() if line]
+
+    second_event = _extract_first_event(second_lines)
+    assert second_event["type"] == "response.completed"
+    assert upstream_attempts[attempts_after_first_request:] == [upstream_attempts[1]]
+
+    async with SessionLocal() as session:
+        accounts = {account.id: account for account in (await session.execute(select(Account))).scalars().all()}
+    revoked_account = next(
+        account for account in accounts.values() if account.chatgpt_account_id == revoked_upstream_account_id
+    )
+    assert revoked_account.id in imported_account_ids
+    assert revoked_account.status == AccountStatus.REAUTH_REQUIRED
+    assert revoked_account.deactivation_reason == "Authentication token revoked - re-login required"
+
+
+@pytest.mark.asyncio
+async def test_proxy_responses_model_plan_eligibility_skips_free_account_before_upstream(async_client, monkeypatch):
+    """A Free credential must not consume an attempt for a Plus-only model."""
+    internal_account_ids: dict[str, str] = {}
+    for raw_account_id, email, plan_type in (
+        ("acc_model_plan_free", "model-plan-free@example.com", "free"),
+        ("acc_model_plan_plus", "model-plan-plus@example.com", "plus"),
+    ):
+        response = await async_client.post(
+            "/api/accounts/import",
+            files={
+                "auth_json": (
+                    f"auth-{plan_type}.json",
+                    json.dumps(_make_auth_json(raw_account_id, email, plan_type=plan_type)),
+                    "application/json",
+                )
+            },
+        )
+        assert response.status_code == 200
+        internal_account_ids[plan_type] = generate_unique_account_id(raw_account_id, email)
+
+    # Model discovery is an external input to routing. Reproduce today's
+    # authoritative catalogs: the Free credential's catalog omits Sol while
+    # the Plus credential advertises it. Request routing below still enters
+    # only through the public endpoint.
+    registry = get_model_registry()
+    model = registry.get_models_with_fallback()["gpt-5.6-sol"]
+    await registry.update(
+        {"free": [], "plus": [model]},
+        per_account_results={
+            internal_account_ids["free"]: ("free", []),
+            internal_account_ids["plus"]: ("plus", [model]),
+        },
+        active_account_plans={
+            internal_account_ids["free"]: "free",
+            internal_account_ids["plus"]: "plus",
+        },
+    )
+
+    upstream_attempts: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
+        del payload, headers, access_token, base_url, raise_for_status, kwargs
+        upstream_attempts.append(account_id)
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_model_plan_ok",'
+            '"object":"response","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        json={
+            "model": "gpt-5.6-sol",
+            "instructions": "hi",
+            "input": [{"type": "message", "role": "user", "content": "hello"}],
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        lines = [line async for line in response.aiter_lines() if line]
+
+    assert _extract_first_event(lines)["response"]["id"] == "resp_model_plan_ok"
+    assert upstream_attempts == ["acc_model_plan_plus"]
+
+
+@pytest.mark.asyncio
+async def test_proxy_responses_account_local_model_not_found_fails_over_within_request(async_client, monkeypatch):
+    """A rollout-local model rejection must not abort while another account can serve it."""
+    for suffix in ("a", "b"):
+        response = await async_client.post(
+            "/api/accounts/import",
+            files={
+                "auth_json": (
+                    f"auth-{suffix}.json",
+                    json.dumps(
+                        _make_auth_json(
+                            f"acc_model_rollout_{suffix}",
+                            f"model-rollout-{suffix}@example.com",
+                            plan_type="plus",
+                        )
+                    ),
+                    "application/json",
+                )
+            },
+        )
+        assert response.status_code == 200
+
+    upstream_attempts: list[str | None] = []
+    rejected_account_id: str | None = None
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
+        del payload, headers, access_token, base_url, raise_for_status, kwargs
+        nonlocal rejected_account_id
+        if rejected_account_id is None:
+            rejected_account_id = account_id
+        upstream_attempts.append(account_id)
+        if account_id == rejected_account_id:
+            raise ProxyResponseError(
+                404,
+                openai_error(
+                    "model_not_found",
+                    "The model is not available for this account yet.",
+                    error_type="invalid_request_error",
+                ),
+                failure_phase="status",
+            )
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_model_rollout_ok",'
+            '"object":"response","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    monkeypatch.setattr(proxy_module, "_STREAM_MAX_ACCOUNT_ATTEMPTS", 2)
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        json={
+            "model": "gpt-6-sol",
+            "instructions": "hi",
+            "input": [{"type": "message", "role": "user", "content": "hello"}],
+            "stream": True,
+            "prompt_cache_key": "model-rollout-public-route",
+        },
+    ) as response:
+        assert response.status_code == 200
+        lines = [line async for line in response.aiter_lines() if line]
+
+    event = _extract_first_event(lines)
+    assert event["type"] == "response.completed", (event, upstream_attempts)
+    assert event["response"]["id"] == "resp_model_rollout_ok"
+    assert len(upstream_attempts) == 2
+    assert upstream_attempts[0] != upstream_attempts[1]
 
 
 @pytest.mark.asyncio

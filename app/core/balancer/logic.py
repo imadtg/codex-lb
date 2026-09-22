@@ -20,6 +20,7 @@ PERMANENT_FAILURE_CODES = {
     "refresh_token_invalidated": "Refresh token was revoked - re-login required",
     "invalid_grant": "Refresh token grant invalid - re-login required",
     "token_invalidated": "Authentication token invalidated - re-login required",
+    "token_revoked": "Authentication token revoked - re-login required",
     # ``token_expired`` from the OAuth refresh endpoint means the refresh
     # request itself failed because the refresh token (or the session it
     # belonged to) is no longer usable -- access-token-only expiry would have
@@ -45,6 +46,7 @@ REAUTH_REQUIRED_FAILURE_CODES = frozenset(
         "refresh_token_invalidated",
         "invalid_grant",
         "token_invalidated",
+        "token_revoked",
         "token_expired",
         "app_session_terminated",
         "account_session_expired",
@@ -52,6 +54,20 @@ REAUTH_REQUIRED_FAILURE_CODES = frozenset(
         "invalid_refresh_token",
     }
 )
+
+ROUTING_BLOCKED_REAUTH_REASONS = frozenset(
+    PERMANENT_FAILURE_CODES[code]
+    for code in (
+        "token_invalidated",
+        "token_revoked",
+        "account_auth_invalidated",
+    )
+)
+
+
+def reauth_reason_blocks_routing(deactivation_reason: str | None) -> bool:
+    """Return whether upstream proved the stored access token unusable."""
+    return deactivation_reason in ROUTING_BLOCKED_REAUTH_REASONS
 
 SECONDS_PER_DAY = 60 * 60 * 24
 SECONDS_PER_HOUR = 60 * 60
@@ -132,6 +148,12 @@ class AccountState:
     last_selected_at: float | None = None
     error_count: int = 0
     deactivation_reason: str | None = None
+
+    @property
+    def blocks_routing(self) -> bool:
+        """Whether durable account state proves this credential cannot route."""
+        return self.status == AccountStatus.DEACTIVATED or reauth_reason_blocks_routing(self.deactivation_reason)
+
     plan_type: str | None = None
     capacity_credits: float | None = None
     health_tier: int = 0
@@ -455,11 +477,10 @@ def _fallback_secondary_capacity_credits(plan_type: str | None) -> float:
 
 
 def _known_expired_reauth(state: AccountState, current: float) -> bool:
-    """Return whether a warning-state account has crossed known token expiry."""
-    return (
-        state.status == AccountStatus.REAUTH_REQUIRED
-        and state.access_token_expires_at is not None
-        and state.access_token_expires_at <= current
+    """Return whether a warning-state account is known to be unroutable."""
+    return state.status == AccountStatus.REAUTH_REQUIRED and (
+        reauth_reason_blocks_routing(state.deactivation_reason)
+        or (state.access_token_expires_at is not None and state.access_token_expires_at <= current)
     )
 
 
@@ -562,7 +583,7 @@ def select_account(
             or bypass_quota_exceeded
             or (bypass_account_ids is not None and state.account_id in bypass_account_ids)
         )
-        if state.status == AccountStatus.DEACTIVATED:
+        if state.blocks_routing:
             continue
         if state.status == AccountStatus.PAUSED:
             continue

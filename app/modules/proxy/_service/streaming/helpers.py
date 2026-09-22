@@ -1087,6 +1087,7 @@ def _is_account_neutral_request_rejection(
 
 def _is_model_scoped_rejection(
     *,
+    code: str,
     http_status: int | None,
     message: str | None,
 ) -> bool:
@@ -1110,9 +1111,11 @@ def _is_model_scoped_rejection(
     normalizes to ``upstream_error``; on other paths it arrives as
     ``invalid_request_error``. Only the exact message shape decides membership.
     """
+    if code == "model_not_found":
+        return is_model_scoped_upstream_rejection(message, error_code=code)
     if http_status is not None and http_status != 400:
         return False
-    return is_model_scoped_upstream_rejection(message)
+    return is_model_scoped_upstream_rejection(message, error_code=code)
 
 
 def _request_usage_refresh(proxy: Any, account_id: str) -> None:
@@ -1187,6 +1190,7 @@ async def _handle_stream_error(
         )
         return classified
     if _is_model_scoped_rejection(
+        code=code,
         http_status=http_status,
         message=error.get("message"),
     ):
@@ -1204,7 +1208,13 @@ async def _handle_stream_error(
     elif classified["failure_class"] == "quota":
         await proxy._load_balancer.mark_quota_exceeded(account, error)
     elif code in PERMANENT_FAILURE_CODES:
-        await proxy._load_balancer.mark_permanent_failure(account, code)
+        downgraded = await proxy._load_balancer.mark_permanent_failure(account, code)
+        if code == "token_revoked" and not downgraded:
+            # A concurrent re-auth won the guarded write. Remove the local
+            # pre-settlement quarantine so the repaired credential can route.
+            from app.modules.proxy.account_cache import clear_account_routing_unavailable
+
+            clear_account_routing_unavailable(account.id)
     else:
         await proxy._load_balancer.record_error(account)
         _facade().logger.info(

@@ -31,6 +31,7 @@ from app.core.balancer.logic import (
     handle_rate_limit,
     plausible_rate_limit_reset_at,
     pool_usage_exhaustion,
+    reauth_reason_blocks_routing,
     select_account,
 )
 
@@ -66,6 +67,7 @@ __all__ = [
     "handle_quota_exceeded",
     "handle_rate_limit",
     "plausible_rate_limit_reset_at",
+    "reauth_reason_blocks_routing",
     "pool_usage_exhaustion",
     "select_account",
 ]
