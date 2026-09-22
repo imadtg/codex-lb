@@ -95,9 +95,10 @@ ID-only unlinking, and different-account reasoning omission. The source
 control returned six recurring values rather than a uniform distribution, so
 the paired comparison uses the source result from each trial as its baseline.
 
-The full cross-account case had Pearson correlation `-0.025`, Spearman
-correlation `0.040`, exact agreement `12%`, and mean absolute difference
-`30.8`. Its distribution was `{1: 41, 37: 2, 42: 57}`, versus the
+The paired association is the primary result: the full cross-account case had
+Pearson correlation `-0.025`, Spearman correlation `0.040`, and mutual
+information `0.077` bits. Exact agreement was `12%`; mean absolute difference
+was `30.8`. Its distribution was `{1: 41, 37: 2, 42: 57}`, versus the
 same-account distribution `{1: 2, 37: 1, 42: 27, 47: 10, 57: 38, 73: 22}`.
 The total variation distance was `0.70` and Jensen-Shannon divergence was
 `0.547` bits. ID-only unlinking and reasoning omission were similarly far from

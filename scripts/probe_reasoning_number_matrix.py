@@ -114,6 +114,19 @@ def _rank(values: list[int]) -> list[float]:
     return [average_rank[value] for value in values]
 
 
+def _mutual_information(xs: list[int], ys: list[int]) -> float | None:
+    if not xs:
+        return None
+    joint = Counter(zip(xs, ys, strict=True))
+    x_counts = Counter(xs)
+    y_counts = Counter(ys)
+    total = len(xs)
+    return sum(
+        count / total * math.log2(count * total / (x_counts[x] * y_counts[y]))
+        for (x, y), count in joint.items()
+    )
+
+
 def _distribution(values: list[int]) -> dict[str, Any]:
     counts = Counter(values)
     total = len(values)
@@ -155,6 +168,7 @@ def _analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
             ),
             "pearson_r": _pearson(xs, ys),
             "spearman_r": _pearson(_rank(xs), _rank(ys)) if len(paired) > 1 else None,
+            "mutual_information_bits": _mutual_information(xs, ys),
         }
     result["paired_comparisons_to_same_account"] = comparisons
     return result

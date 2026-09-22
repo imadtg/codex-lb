@@ -24,9 +24,9 @@
     "different_account_omit_reasoning": {"n": 100, "mean": 26.01, "stdev": 19.997747, "entropy_bits": 0.964800, "counts": {"1": 39, "42": 61}}
   },
   "paired_comparisons_to_same_account": {
-    "different_account_full": {"exact_match_rate": 0.12, "mean_absolute_difference": 30.8, "pearson_r": -0.025287, "spearman_r": 0.040219, "total_variation_distance": 0.70, "jensen_shannon_bits": 0.547387},
-    "different_account_strip_ids": {"exact_match_rate": 0.14, "mean_absolute_difference": 31.83, "pearson_r": 0.113235, "spearman_r": 0.127605, "total_variation_distance": 0.71, "jensen_shannon_bits": 0.568118},
-    "different_account_omit_reasoning": {"exact_match_rate": 0.21, "mean_absolute_difference": 28.14, "pearson_r": 0.079521, "spearman_r": 0.013001, "total_variation_distance": 0.71, "jensen_shannon_bits": 0.550991}
+    "different_account_full": {"exact_match_rate": 0.12, "mean_absolute_difference": 30.8, "pearson_r": -0.025287, "spearman_r": 0.040219, "mutual_information_bits": 0.076814, "total_variation_distance": 0.70, "jensen_shannon_bits": 0.547387},
+    "different_account_strip_ids": {"exact_match_rate": 0.14, "mean_absolute_difference": 31.83, "pearson_r": 0.113235, "spearman_r": 0.127605, "mutual_information_bits": 0.020643, "total_variation_distance": 0.71, "jensen_shannon_bits": 0.568118},
+    "different_account_omit_reasoning": {"exact_match_rate": 0.21, "mean_absolute_difference": 28.14, "pearson_r": 0.079521, "spearman_r": 0.013001, "mutual_information_bits": 0.049808, "total_variation_distance": 0.71, "jensen_shannon_bits": 0.550991}
   },
   "interpretation": {
     "cross_account_full_reasoning_matches_source_distribution": false,
