@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-22",
+  "endpoint": "https://chatgpt.com/backend-api/codex/responses",
+  "model": "gpt-5.6-luna",
+  "client_version": "0.156.0",
+  "account_relation": "two active Free accounts; identifiers omitted",
+  "request_invariants": {
+    "store": false,
+    "previous_response_id": false,
+    "via_codex_lb": false
+  },
+  "repetitions": 100,
+  "cases": [
+    "same_account_full",
+    "different_account_full",
+    "different_account_strip_ids",
+    "different_account_omit_reasoning"
+  ],
+  "distributions": {
+    "same_account_full": {"n": 100, "mean": 54.15, "stdev": 13.625986, "entropy_bits": 2.032556, "counts": {"1": 2, "37": 1, "42": 27, "47": 10, "57": 38, "73": 22}},
+    "different_account_full": {"n": 100, "mean": 25.09, "stdev": 20.093827, "entropy_bits": 1.102513, "counts": {"1": 41, "37": 2, "42": 57}},
+    "different_account_strip_ids": {"n": 100, "mean": 23.14, "stdev": 20.434295, "entropy_bits": 0.995378, "counts": {"1": 46, "42": 54}},
+    "different_account_omit_reasoning": {"n": 100, "mean": 26.01, "stdev": 19.997747, "entropy_bits": 0.964800, "counts": {"1": 39, "42": 61}}
+  },
+  "paired_comparisons_to_same_account": {
+    "different_account_full": {"exact_match_rate": 0.12, "mean_absolute_difference": 30.8, "pearson_r": -0.025287, "spearman_r": 0.040219, "total_variation_distance": 0.70, "jensen_shannon_bits": 0.547387},
+    "different_account_strip_ids": {"exact_match_rate": 0.14, "mean_absolute_difference": 31.83, "pearson_r": 0.113235, "spearman_r": 0.127605, "total_variation_distance": 0.71, "jensen_shannon_bits": 0.568118},
+    "different_account_omit_reasoning": {"exact_match_rate": 0.21, "mean_absolute_difference": 28.14, "pearson_r": 0.079521, "spearman_r": 0.013001, "total_variation_distance": 0.71, "jensen_shannon_bits": 0.550991}
+  },
+  "interpretation": {
+    "cross_account_full_reasoning_matches_source_distribution": false,
+    "cross_account_full_is_better_than_omitting_reasoning": "Not in this probe's number-recall metric; both cross-account cases were far from the same-account distribution. Full replay is still required because the ciphertext is validated context and may carry useful state for other continuations.",
+    "source_prompt_uniformity": "The model did not produce a uniform 1-100 source distribution despite the instruction, so paired agreement and distribution separation are more informative than a uniformity test.",
+    "conclusion": "The tested backend accepts and validates reasoning ciphertext across accounts, but the target account does not reliably recover the same hidden committed number. Preserve the ciphertext; do not claim hidden-state continuity across accounts."
+  },
+  "privacy": {
+    "contains_access_token": false,
+    "contains_raw_reasoning": false,
+    "contains_ciphertext": false,
+    "contains_account_identifier": false,
+    "contains_raw_model_text": false,
+    "contains_per_trial_values": false
+  }
+}

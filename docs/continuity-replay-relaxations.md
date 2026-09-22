@@ -86,6 +86,32 @@ The redacted machine-readable evidence is
 [`docs/evidence/cross-account-context-portability-2026-09-22.json`](evidence/cross-account-context-portability-2026-09-22.json).
 The repeated reasoning controls are recorded in
 [`docs/evidence/cross-account-reasoning-repeatability-2026-09-22.json`](evidence/cross-account-reasoning-repeatability-2026-09-22.json).
+
+To test the exact question more directly, a 100-trial Luna matrix asked the
+source turn to choose a number from 1 to 100 only in hidden reasoning, then
+replayed the same prefix into four independently regenerated second turns:
+same-account full history, different-account full history, different-account
+ID-only unlinking, and different-account reasoning omission. The source
+control returned six recurring values rather than a uniform distribution, so
+the paired comparison uses the source result from each trial as its baseline.
+
+The full cross-account case had Pearson correlation `-0.025`, Spearman
+correlation `0.040`, exact agreement `12%`, and mean absolute difference
+`30.8`. Its distribution was `{1: 41, 37: 2, 42: 57}`, versus the
+same-account distribution `{1: 2, 37: 1, 42: 27, 47: 10, 57: 38, 73: 22}`.
+The total variation distance was `0.70` and Jensen-Shannon divergence was
+`0.547` bits. ID-only unlinking and reasoning omission were similarly far from
+the source distribution, with total variation distance `0.71` each.
+
+This is the clearest evidence so far that the target does not reliably recover
+the same hidden committed number. The backend still accepted the reasoning
+ciphertext in the earlier controls and rejected corrupted ciphertext, so the
+safe proxy behavior is to preserve it verbatim while making no promise that
+cross-account hidden-state continuity is equivalent to same-account
+continuation. The reusable matrix probe is
+[`scripts/probe_reasoning_number_matrix.py`](../scripts/probe_reasoning_number_matrix.py),
+and its redacted aggregate is
+[`docs/evidence/reasoning-number-matrix-luna-100.json`](evidence/reasoning-number-matrix-luna-100.json).
 The rerunnable probe is
 [`scripts/probe_cross_account_context_portability.py`](../scripts/probe_cross_account_context_portability.py).
 It requires four environment variables for disposable source and target
