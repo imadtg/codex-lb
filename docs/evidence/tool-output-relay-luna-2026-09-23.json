@@ -1,7 +1,21 @@
 {
   "account_relation": "two active accounts; IDs omitted",
   "client_version": "0.156.0",
-  "conclusion": "The direct ChatGPT Codex endpoint rejected the owner-bound previous_response_id delta before inference. The same local tool output embedded in a complete projected transcript was accepted by account B and produced the expected continuation.",
+  "complete_transcript_relay_chain": {
+    "a_complete_transcript": {
+      "expected_ack": true,
+      "http_status": 200,
+      "terminal": "response.completed",
+      "text_sha256": "7b7af2d67f5395ee1303be1dace546b98c626a3f25868707962de7c5f9842b38"
+    },
+    "b_projected_after_a": {
+      "expected_ack": true,
+      "http_status": 200,
+      "terminal": "response.completed",
+      "text_sha256": "7b7af2d67f5395ee1303be1dace546b98c626a3f25868707962de7c5f9842b38"
+    }
+  },
+  "conclusion": "A can finish if it is still available and receives a complete transcript; that finished continuation can then be projected to B. This does not rescue an exhausted A, because the relay step itself requires A to accept another model request. B can also continue directly from the complete call/output transcript.",
   "endpoint": "https://chatgpt.com/backend-api/codex/responses",
   "model": "gpt-5.6-luna",
   "observed_at": "2026-09-23T13:26:24.359587+00:00",
