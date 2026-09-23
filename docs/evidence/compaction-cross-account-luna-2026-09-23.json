@@ -1,0 +1,66 @@
+{
+  "account_relation": "two active accounts; IDs omitted",
+  "client_version": "0.156.0",
+  "compaction_encrypted_content_bytes": 1444,
+  "compaction_output_types": [
+    "compaction"
+  ],
+  "compaction_status": 200,
+  "endpoint": "https://chatgpt.com/backend-api/codex/responses",
+  "model": "gpt-5.6-luna",
+  "observed_at": "2026-09-23T09:05:24.045922+00:00",
+  "privacy": {
+    "contains_access_token": false,
+    "contains_account_identifier": false,
+    "contains_raw_ciphertext": false,
+    "contains_raw_model_text": false
+  },
+  "request_invariants": {
+    "previous_response_id": false,
+    "store": false,
+    "via_codex_lb": false
+  },
+  "results": [
+    {
+      "error_codes": [],
+      "http_status": 200,
+      "matches_marker": true,
+      "name": "same_account_full",
+      "terminal": "response.completed",
+      "text_bytes": 21,
+      "text_sha256": "26a197b5ec1dac4e1c4ed2810929acc15bbd296643fd0edd15589f9201aa6c41"
+    },
+    {
+      "error_codes": [],
+      "http_status": 200,
+      "matches_marker": true,
+      "name": "different_account_full",
+      "terminal": "response.completed",
+      "text_bytes": 21,
+      "text_sha256": "26a197b5ec1dac4e1c4ed2810929acc15bbd296643fd0edd15589f9201aa6c41"
+    },
+    {
+      "error_codes": [],
+      "http_status": 200,
+      "matches_marker": true,
+      "name": "different_account_strip_id",
+      "terminal": "response.completed",
+      "text_bytes": 21,
+      "text_sha256": "26a197b5ec1dac4e1c4ed2810929acc15bbd296643fd0edd15589f9201aa6c41"
+    },
+    {
+      "error_codes": [
+        "invalid_encrypted_content"
+      ],
+      "http_status": 400,
+      "matches_marker": false,
+      "name": "different_account_corrupt",
+      "terminal": null,
+      "text_bytes": 0,
+      "text_sha256": null
+    }
+  ],
+  "scenario": "A complete prefix was compacted on account A; only the returned compaction item was continued on A and B, with ID-unlinked and corrupted controls.",
+  "schema_version": 1,
+  "source_status": 200
+}

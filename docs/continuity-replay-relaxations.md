@@ -130,22 +130,31 @@ It requires four environment variables for disposable source and target
 credentials, never reads the codex-lb database, and records no raw model text,
 tokens, ciphertext, or account IDs.
 
-## Compaction boundary
+## Compaction portability
 
-On 2026-09-23, a direct `store: false` Luna request supplied a private marker,
-sent the complete prefix through `compaction_trigger`, and continued with only
-the returned `compaction` item. OpenAI returned HTTP 200 for both operations;
-the continuation recovered the marker exactly. The compaction output contained
-an opaque 1,484-byte `encrypted_content` field. The redacted result is
+On 2026-09-23, a direct `store: false` Luna request supplied an ordinary study
+code, sent the complete prefix through `compaction_trigger`, and returned one
+opaque `compaction.encrypted_content` item (1,444 bytes in the recorded run).
+The exact item was continued four ways: on the source account, on a second
+account unchanged, on the second account with its top-level response `id`
+removed, and on the second account after changing one ciphertext byte. The
+first three completed with HTTP 200 and recovered the study code. The changed
+ciphertext failed with HTTP 400 `invalid_encrypted_content`.
+
+The redacted result is
+[`docs/evidence/compaction-cross-account-luna-2026-09-23.json`](evidence/compaction-cross-account-luna-2026-09-23.json).
+The earlier same-account-only control remains at
 [`docs/evidence/compaction-memory-luna-2026-09-23.json`](evidence/compaction-memory-luna-2026-09-23.json).
 
-This establishes that compaction output is essential retained context on its
-origin account. It does not establish that a compaction item can be projected
-to another account, so the replay gate continues to keep compaction history
-owner-bound until a separate cross-account valid/corrupt experiment proves
-otherwise. The new reasoning/search relaxation therefore preserves validated
-completed records but does not broaden the gate for compaction, hosted state,
-files, turn state, or prior-response anchors.
+This is the missing experiment separating the same-account control from the
+cross-account workaround. It shows that the ChatGPT backend accepts and
+validates this completed compaction context across the tested accounts. The
+account-neutral replay gate therefore preserves a completed compaction item
+and removes only its response-owned top-level `id`. The provider-portability
+gate remains stricter: compaction is still rejected when the destination is a
+third-party model source, because this experiment says nothing about that
+provider's ability to interpret OpenAI's encrypted format. Hosted state, files,
+turn state, and prior-response anchors remain account/provider-bound.
 
 ## Encrypted collaboration experiment
 

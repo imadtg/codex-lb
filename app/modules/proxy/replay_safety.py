@@ -27,7 +27,7 @@ _TOOL_CALL_TYPES = frozenset(_TOOL_CALL_TYPE_BY_OUTPUT_TYPE.values())
 # are therefore retained and validated below; only their top-level source IDs
 # are unlinked by the projection.
 _ACCOUNT_NEUTRAL_REPLAY_CONTEXT_ITEM_TYPES = frozenset(
-    {"reasoning", "tool_search_call", "tool_search_output", "web_search_call"}
+    {"compaction", "reasoning", "tool_search_call", "tool_search_output", "web_search_call"}
 )
 _INTERNAL_CHAT_MESSAGE_METADATA_FIELD = "internal_chat_message_metadata_passthrough"
 _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id", "content_item_kinds"})
@@ -1274,8 +1274,10 @@ def _retained_context_item_is_replayable(item: Mapping[str, JsonValue]) -> bool:
     The backend accepts these records across ChatGPT accounts, but their
     contents are opaque and may evolve.  Keep their fields verbatim while
     rejecting unfinished records and explicit account/resource references.
-    ``reasoning.encrypted_content`` is deliberately exempt from the generic
-    encrypted-content ownership check: it is the useful context under test.
+    ``reasoning.encrypted_content`` and ``compaction.encrypted_content`` are
+    deliberately exempt from the generic encrypted-content ownership check:
+    they are useful context under test and the ChatGPT backend validates them
+    independently during cross-account replay.
     """
 
     item_type = item.get("type")
@@ -1284,7 +1286,7 @@ def _retained_context_item_is_replayable(item: Mapping[str, JsonValue]) -> bool:
     status = item.get("status")
     if status is not None and status not in {"completed", "failed"}:
         return False
-    if item_type == "reasoning":
+    if item_type in {"reasoning", "compaction"}:
         encrypted = item.get("encrypted_content")
         if not _is_nonblank_string(encrypted):
             return False

@@ -324,6 +324,28 @@ def test_account_neutral_replay_accepts_preserved_reasoning_and_completed_search
     assert responses_payload_is_account_neutral_fresh_replay(payload) is True
 
 
+def test_account_neutral_replay_accepts_completed_compaction_context() -> None:
+    payload = {
+        "input": [
+            {"type": "compaction", "encrypted_content": "opaque-compaction"},
+            {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ]
+    }
+    assert responses_payload_is_account_neutral_fresh_replay(payload) is True
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "compaction"},
+        {"type": "compaction", "encrypted_content": "   "},
+        {"type": "compaction", "encrypted_content": "opaque", "status": "in_progress"},
+    ],
+)
+def test_account_neutral_replay_rejects_invalid_compaction_context(item: dict[str, JsonValue]) -> None:
+    assert responses_payload_is_account_neutral_fresh_replay({"input": [item]}) is False
+
+
 @pytest.mark.parametrize(
     "search_item",
     [
