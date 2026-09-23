@@ -1,0 +1,51 @@
+{
+  "client_version": "0.156.0",
+  "model": "gpt-5.6-luna",
+  "privacy": {
+    "contains_access_token": false,
+    "contains_account_identifier": false,
+    "contains_raw_ciphertext": false,
+    "contains_raw_model_text": false
+  },
+  "quota_was_not_forced": true,
+  "results": [
+    {
+      "codes": [],
+      "expected_ack": true,
+      "name": "A_valid",
+      "status": 200,
+      "terminal": "response.completed",
+      "text_bytes": 13,
+      "text_sha256": "7b7af2d67f5395ee1303be1dace546b98c626a3f25868707962de7c5f9842b38"
+    },
+    {
+      "codes": [],
+      "expected_ack": false,
+      "name": "A_nonexistent_model",
+      "status": 400,
+      "terminal": null,
+      "text_bytes": 0,
+      "text_sha256": null
+    },
+    {
+      "codes": [],
+      "expected_ack": true,
+      "name": "B_valid",
+      "status": 200,
+      "terminal": "response.completed",
+      "text_bytes": 13,
+      "text_sha256": "7b7af2d67f5395ee1303be1dace546b98c626a3f25868707962de7c5f9842b38"
+    },
+    {
+      "codes": [],
+      "expected_ack": false,
+      "name": "B_nonexistent_model",
+      "status": 400,
+      "terminal": null,
+      "text_bytes": 0,
+      "text_sha256": null
+    }
+  ],
+  "scenario": "A local call/output transcript was constructed once, then replayed as a complete body under valid and nonexistent-model pre-inference controls on A and B.",
+  "schema_version": 1
+}

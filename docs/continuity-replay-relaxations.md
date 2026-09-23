@@ -70,6 +70,25 @@ complete call/output transcript, which succeeded in this experiment. The
 redacted artifact is
 [`docs/evidence/tool-output-relay-luna-2026-09-23.json`](evidence/tool-output-relay-luna-2026-09-23.json).
 
+## Pre-inference handoff controls
+
+On 2026-09-23, a local function-call transcript was replayed as a complete
+body on two Luna accounts. The valid complete body succeeded on both accounts.
+Changing only the model to a nonexistent model produced HTTP 400 before any
+continuation on either account; sending the same complete body with the valid
+model to account B succeeded. This is a safe pre-inference proxy for the
+account refusing a request: it verifies that preserving the call and its local
+output is sufficient for a healthy account to continue. It is deliberately not
+claimed to reproduce quota exhaustion, which was not forced or consumed. The
+redacted artifact is
+[`docs/evidence/tool-handoff-model-failure-controls-luna-2026-09-23.json`](evidence/tool-handoff-model-failure-controls-luna-2026-09-23.json).
+
+Combined with the relay experiment, the practical state machine is clear: an
+owner can be probed only when the request is pre-inference safe; if it rejects,
+retry the complete call/output transcript on another eligible account. A
+previous-response-ID delta is not a relayable fallback, and a complete local
+tool result must be retained to make the handoff possible.
+
 ## Owner-bound local-tool follow-up diagnostic
 
 The native WebSocket preparation path now emits a content-free
