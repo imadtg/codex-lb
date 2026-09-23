@@ -1,0 +1,48 @@
+{
+  "account_relation": "two active accounts; IDs omitted",
+  "client_version": "0.156.0",
+  "conclusion": "The direct ChatGPT Codex endpoint rejected the owner-bound previous_response_id delta before inference. The same local tool output embedded in a complete projected transcript was accepted by account B and produced the expected continuation.",
+  "endpoint": "https://chatgpt.com/backend-api/codex/responses",
+  "model": "gpt-5.6-luna",
+  "observed_at": "2026-09-23T13:26:24.359587+00:00",
+  "privacy": {
+    "contains_access_token": false,
+    "contains_account_identifier": false,
+    "contains_raw_ciphertext": false,
+    "contains_raw_model_text": false
+  },
+  "scenario": "A emits a local function call; the client supplies its result. Compare owner delta versus full projected transcript on B.",
+  "schema_version": 1,
+  "source_delta": {
+    "error_codes": [],
+    "error_detail": "Unsupported parameter: previous_response_id",
+    "http_status": 400,
+    "matches_expected": null,
+    "name": "source_account_tool_output_delta",
+    "terminal": null,
+    "text_bytes": 0,
+    "text_sha256": null
+  },
+  "source_initial": {
+    "error_codes": [],
+    "http_status": 200,
+    "matches_expected": null,
+    "name": "source_initial",
+    "terminal": "response.completed",
+    "text_bytes": 0,
+    "text_sha256": null
+  },
+  "source_initial_output_types": [
+    "function_call"
+  ],
+  "source_tool_call_id_present": true,
+  "target_full_projected_transcript": {
+    "error_codes": [],
+    "http_status": 200,
+    "matches_expected": true,
+    "name": "target_account_full_projected_transcript",
+    "terminal": "response.completed",
+    "text_bytes": 13,
+    "text_sha256": "7b7af2d67f5395ee1303be1dace546b98c626a3f25868707962de7c5f9842b38"
+  }
+}

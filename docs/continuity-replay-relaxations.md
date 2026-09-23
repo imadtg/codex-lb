@@ -51,6 +51,22 @@ permanently, and a second eligible account receives the ID-unlinked full
 history and completes. The regression asserts that reasoning, tool-search,
 web-search, messages, and all nested fields survive the handoff.
 
+## Local-tool relay experiment
+
+On 2026-09-23, a direct Luna request on account A emitted a client function
+call whose simulated local result was `TOOL-RESULT-7319`. Sending only that
+result with the source `previous_response_id` was rejected by the ChatGPT Codex
+endpoint before inference with HTTP 400 `Unsupported parameter:
+previous_response_id`. The same call plus result, embedded in a complete ID-unlinked
+transcript, was accepted by account B and produced the expected continuation.
+
+This answers the proposed relay precisely: there is no useful intermediate
+response to “pass through A” and then switch to B. The owner-delta form itself
+is not an independently portable request on this endpoint. The workable path is
+to retain or reconstruct the complete call/output transcript and send that
+self-contained body to B. The redacted artifact is
+[`docs/evidence/tool-output-relay-luna-2026-09-23.json`](evidence/tool-output-relay-luna-2026-09-23.json).
+
 ## Owner-bound local-tool follow-up diagnostic
 
 The native WebSocket preparation path now emits a content-free
