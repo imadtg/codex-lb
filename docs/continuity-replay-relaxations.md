@@ -51,6 +51,22 @@ permanently, and a second eligible account receives the ID-unlinked full
 history and completes. The regression asserts that reasoning, tool-search,
 web-search, messages, and all nested fields survive the handoff.
 
+## Owner-bound local-tool follow-up diagnostic
+
+The native WebSocket preparation path now emits a content-free
+`continuity_tool_output_delta version=1` event whenever a request carries a
+`previous_response_id` and one or more tool-output items. It records only the
+number of input items, tool calls, tool outputs, and whether a complete fresh
+resend was proven safe. This distinguishes the case where a local tool has
+already run but the client sent only an owner-bound output delta. The event
+does not log the response ID, call IDs, arguments, or tool output.
+
+The historical T3 provider logs were searched for this shape and for
+`previous_response_owner_unavailable`/quota errors. They contain mentions from
+the agent transcript and shell output, but no codex-lb runtime telemetry proving
+that this exact local-tool/quota transition occurred. The new event is therefore
+the marker to check if the symptom resurfaces.
+
 ## Context portability experiment
 
 On 2026-09-22, a disposable direct-OpenAI probe ran twice between two active
