@@ -1083,6 +1083,9 @@ class _StreamingRetryMixin:
                     tool_call_dedupe=tool_call_dedupe,
                     enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                     thread_cache_identity=ThreadCacheIdentity(thread_cache_identity_mode, account.id),
+                    buffer_accepted_capacity_prelude=(
+                        preserve_native_failure_lifecycle and upstream_stream_transport == _REQUEST_TRANSPORT_HTTP
+                    ),
                 )
                 try:
                     try:
@@ -2422,6 +2425,10 @@ class _StreamingRetryMixin:
                                 tool_call_dedupe=tool_call_dedupe,
                                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                                 thread_cache_identity=ThreadCacheIdentity(thread_cache_identity_mode, account.id),
+                                buffer_accepted_capacity_prelude=(
+                                    preserve_native_failure_lifecycle
+                                    and upstream_stream_transport == _REQUEST_TRANSPORT_HTTP
+                                ),
                             )
                             try:
                                 try:
@@ -2978,6 +2985,13 @@ class _StreamingRetryMixin:
                         return
                     continue  # outer loop: account failover after transient exhaustion
                 except _RetryableStreamError as exc:
+                    if getattr(exc, "accepted_capacity", False):
+                        _facade().logger.info(
+                            "stream_accepted_capacity_retry_scheduled request_id=%s account_id=%s code=%s",
+                            request_id,
+                            account.id,
+                            exc.code,
+                        )
                     if _facade()._is_security_work_authorization_required_error(exc.code, exc.error.get("message")):
                         if (
                             account.security_work_authorized
@@ -3798,6 +3812,13 @@ class _StreamingRetryMixin:
                 return
             if last_retryable_stream_error is not None:
                 retries_exhausted_msg = str(last_retryable_stream_error.error.get("message") or "Upstream error")
+                if getattr(last_retryable_stream_error, "accepted_capacity", False):
+                    _facade().logger.warning(
+                        "stream_accepted_capacity_retry_exhausted request_id=%s code=%s message=%s",
+                        request_id,
+                        last_retryable_stream_error.code,
+                        retries_exhausted_msg,
+                    )
                 event = response_failed_event(
                     last_retryable_stream_error.code,
                     retries_exhausted_msg,

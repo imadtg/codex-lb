@@ -235,6 +235,99 @@ async def test_stream_overload_alias_surfaces_without_replay(async_client, monke
 
 
 @pytest.mark.asyncio
+async def test_stream_accepted_output_free_capacity_retries_before_lifecycle_visible(async_client, monkeypatch):
+    """A real HTTP stream prelude must not make an output-free capacity error terminal.
+
+    OpenAI can send ``response.created`` and ``response.in_progress`` before
+    deciding that the selected model is at capacity. Those frames are
+    provisional: retrying before exposing them lets the client observe one
+    lifecycle instead of a failed lifecycle followed by a second response.
+    """
+    await _import_account(async_client, "acc_http_capacity_prelude", "http-capacity-prelude@example.com")
+    call_count = 0
+    seen_account_ids: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        nonlocal call_count
+        del payload, headers, access_token, base_url, raise_for_status
+        call_count += 1
+        seen_account_ids.append(account_id)
+        response_id = f"resp_capacity_attempt_{call_count}"
+        yield _sse_event(
+            {"type": "response.created", "response": {"id": response_id, "status": "in_progress"}}
+        )
+        yield _sse_event(
+            {"type": "response.in_progress", "response": {"id": response_id, "status": "in_progress"}}
+        )
+        if call_count == 1:
+            yield _sse_event(
+                {
+                    "type": "error",
+                    "error": {
+                        "code": "server_is_overloaded",
+                        "message": "The model is at capacity. Please try again later.",
+                    },
+                }
+            )
+            return
+        yield _success_sse_event(response_id)
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True}
+    async with async_client.stream(
+        "POST", "/backend-api/codex/responses", json=payload, headers={"user-agent": "codex_exec/0.153.4"}
+    ) as resp:
+        assert resp.status_code == 200
+        lines = [line async for line in resp.aiter_lines() if line]
+
+    events = _extract_events(lines)
+    assert call_count == 2, events
+    assert seen_account_ids == ["acc_http_capacity_prelude", "acc_http_capacity_prelude"]
+    lifecycle = [event for event in events if event["type"] != "codex.keepalive"]
+    assert [event["type"] for event in lifecycle] == ["response.created", "response.in_progress", "response.completed"]
+    assert lifecycle[-1]["response"]["id"] == lifecycle[0]["response"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_stream_accepted_output_free_capacity_exhaustion_is_single_lifecycle(async_client, monkeypatch):
+    """Bounded capacity retries never leak a provisional prelude more than once."""
+    await _import_account(async_client, "acc_http_capacity_exhausted", "http-capacity-exhausted@example.com")
+    call_count = 0
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        nonlocal call_count
+        del payload, headers, access_token, account_id, base_url, raise_for_status
+        call_count += 1
+        response_id = f"resp_capacity_attempt_{call_count}"
+        yield _sse_event({"type": "response.created", "response": {"id": response_id, "status": "in_progress"}})
+        yield _sse_event({"type": "response.in_progress", "response": {"id": response_id, "status": "in_progress"}})
+        yield _sse_event(
+            {
+                "type": "error",
+                "error": {"code": "server_is_overloaded", "message": "The model is at capacity."},
+            }
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True}
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        json=payload,
+        headers={"user-agent": "codex_exec/0.153.4"},
+    ) as resp:
+        assert resp.status_code == 200
+        lines = [line async for line in resp.aiter_lines() if line]
+
+    events = _extract_events(lines)
+    lifecycle = [event for event in events if event.get("type") != "codex.keepalive"]
+    assert call_count >= 2
+    assert sum(event.get("type") == "response.created" for event in lifecycle) <= 1
+    assert sum(event.get("type") == "response.in_progress" for event in lifecycle) <= 1
+    assert lifecycle[-1].get("type") in {"response.failed", "error"}
+
+
+@pytest.mark.asyncio
 async def test_stream_timeout_surfaces_without_replay(async_client, monkeypatch):
     """An upstream terminal timeout is not proven pre-dispatch work."""
     await _import_account(async_client, "acc_trans_timeout", "timeout@example.com")

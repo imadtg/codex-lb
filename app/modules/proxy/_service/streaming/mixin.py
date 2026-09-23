@@ -408,6 +408,7 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
     _parse_openai_error,
     _upstream_error_from_openai,
+    is_upstream_model_capacity_error,
 )
 from app.modules.proxy.http_bridge_forwarding import (
     HTTPBridgeForwardContext as HTTPBridgeForwardContext,
@@ -431,6 +432,12 @@ def _facade() -> Any:
 
 
 _REQUEST_TRANSPORT_HTTP = "http"
+
+
+class _AcceptedCapacityRetry(_RetryableStreamError):
+    """Retry an accepted, output-free capacity terminal before it is visible."""
+
+    accepted_capacity = True
 
 
 class _StreamingMixin(_StreamingRetryMixin):
@@ -496,10 +503,12 @@ class _StreamingMixin(_StreamingRetryMixin):
         tool_call_dedupe: _WebSocketUpstreamControl | None = None,
         enforce_openai_sdk_contract: bool = True,
         thread_cache_identity: ThreadCacheIdentity | None = None,
+        buffer_accepted_capacity_prelude: bool = False,
     ) -> AsyncIterator[str]:
         proxy = cast(_StreamingServiceProtocol, self)
         clock = clock_for(proxy)
         preserve_native_failure_lifecycle = not enforce_openai_sdk_contract and _is_native_codex_request(headers)
+        buffered_capacity_prefix: list[str] = []
         account_id_value = account.id
         access_token = proxy._encryptor.decrypt(account.access_token_encrypted)
         account_id = _header_account_id(account.chatgpt_account_id)
@@ -777,14 +786,22 @@ class _StreamingMixin(_StreamingRetryMixin):
                         latency_first_token_ms = _ttft_event_latency_ms(
                             event_type, first_payload, ttft_reasoning_deltas, attempt_started_at, now=clock.monotonic()
                         )
-                    settlement.downstream_visible = True
-                    if event_type in _facade()._TEXT_DELTA_EVENT_TYPES:
-                        settlement.downstream_text_visible = True
-                    yield first
+                    if buffer_accepted_capacity_prelude and event_type in {"response.created", "response.in_progress"}:
+                        buffered_capacity_prefix.append(first)
+                    else:
+                        settlement.downstream_visible = True
+                        if event_type in _facade()._TEXT_DELTA_EVENT_TYPES:
+                            settlement.downstream_text_visible = True
+                        yield first
             if terminal_stream_error is not None:
                 raise terminal_stream_error
             async for line in iterator:
-                if verbatim_type := _verbatim_relay_event_type(line, latency_first_token_ms, ttft_reasoning_deltas):
+                if (
+                    verbatim_type := _verbatim_relay_event_type(line, latency_first_token_ms, ttft_reasoning_deltas)
+                ) and (
+                    not buffer_accepted_capacity_prelude
+                    or verbatim_type not in {"response.created", "response.in_progress"}
+                ):
                     await _touch_api_key_reservation()
                     if verbatim_type in _facade()._TEXT_DELTA_EVENT_TYPES:
                         saw_text_delta = settlement.downstream_text_visible = True
@@ -940,6 +957,40 @@ class _StreamingMixin(_StreamingRetryMixin):
                     continue
                 if event_payload is not None and not preserve_raw_sse_line:
                     line = format_sse_event(event_payload)
+                if (
+                    buffer_accepted_capacity_prelude
+                    and buffered_capacity_prefix
+                    and event_type in {"response.failed", "error"}
+                    and not saw_text_delta
+                    and (
+                        error_code in {"server_is_overloaded", "overloaded_error", "model_at_capacity"}
+                        or is_upstream_model_capacity_error(error_message)
+                    )
+                ):
+                    _facade().logger.info(
+                        "stream_accepted_capacity_retry request_id=%s account_id=%s "
+                        "buffered_events=%s code=%s",
+                        request_id,
+                        account_id_value,
+                        len(buffered_capacity_prefix),
+                        error_code or "server_is_overloaded",
+                    )
+                    raise _AcceptedCapacityRetry(
+                        (
+                            error_code
+                            if error_code in {"server_is_overloaded", "overloaded_error"}
+                            else "server_is_overloaded"
+                        ),
+                        settlement.error or {"message": error_message or "Upstream model is at capacity"},
+                    )
+                if buffer_accepted_capacity_prelude and event_type in {"response.created", "response.in_progress"}:
+                    buffered_capacity_prefix.append(line)
+                    continue
+                if buffer_accepted_capacity_prelude and buffered_capacity_prefix:
+                    settlement.downstream_visible = True
+                    for prefix_line in buffered_capacity_prefix:
+                        yield prefix_line
+                    buffered_capacity_prefix.clear()
                 settlement.downstream_visible = True
                 if event_type in _facade()._TEXT_DELTA_EVENT_TYPES:
                     settlement.downstream_text_visible = True
@@ -1002,6 +1053,8 @@ class _StreamingMixin(_StreamingRetryMixin):
             )
             return
         except _TerminalStreamError:
+            raise
+        except _AcceptedCapacityRetry:
             raise
         except (asyncio.CancelledError, GeneratorExit):
             if not terminal_event_seen:
