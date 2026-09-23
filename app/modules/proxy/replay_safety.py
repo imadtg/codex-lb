@@ -21,7 +21,12 @@ _TOOL_CALL_TYPE_BY_OUTPUT_TYPE = {
     "apply_patch_call_output": "apply_patch_call",
 }
 _TOOL_CALL_TYPES = frozenset(_TOOL_CALL_TYPE_BY_OUTPUT_TYPE.values())
-_ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES = frozenset(
+# These response-owned items used to be deleted from an account handoff.  A
+# direct two-account experiment showed that OpenAI accepts the intact
+# reasoning/search records and that omission changes the model context.  They
+# are therefore retained and validated below; only their top-level source IDs
+# are unlinked by the projection.
+_ACCOUNT_NEUTRAL_REPLAY_CONTEXT_ITEM_TYPES = frozenset(
     {"reasoning", "tool_search_call", "tool_search_output", "web_search_call"}
 )
 _INTERNAL_CHAT_MESSAGE_METADATA_FIELD = "internal_chat_message_metadata_passthrough"
@@ -98,6 +103,7 @@ _ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES = frozenset(
     }
 )
 _CODEX_ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES = _ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES | {"agent_message"}
+_CODEX_ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES |= _ACCOUNT_NEUTRAL_REPLAY_CONTEXT_ITEM_TYPES
 _ACCOUNT_NEUTRAL_MESSAGE_CONTENT_TYPES = frozenset(
     {"input_file", "input_image", "input_text", "output_text", "refusal", "text"}
 )
@@ -335,11 +341,6 @@ def _project_account_neutral_replay_item(
         return item
     if item_type is not None and not isinstance(item_type, str):
         return item
-    if item_type == "reasoning" or (
-        item_type in _ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES and item.get("status") == "completed"
-    ):
-        return None
-
     if "id" not in item:
         return item
     projected_item = dict(item)
@@ -523,6 +524,13 @@ def responses_input_suffix_retains_prior_output(
             fresh_followup_seen = True
             fresh_followup_count += 1
             fresh_followup_is_user_message = False
+            continue
+        if item_type in _ACCOUNT_NEUTRAL_REPLAY_CONTEXT_ITEM_TYPES:
+            if not _retained_context_item_is_replayable(item) or pending_suffix_calls:
+                return False
+            # Search/reasoning records are part of the retained response
+            # context, but they do not themselves establish the assistant
+            # turn boundary. The completed assistant message remains required.
             continue
         if item_type in _TOOL_CALL_TYPES:
             if item.get("status") not in (None, "completed"):
@@ -913,6 +921,8 @@ def _caller_is_self_contained(item: Mapping[str, JsonValue]) -> bool:
 
 
 def _input_item_has_only_known_fields(item: Mapping[str, JsonValue], item_type: str | None) -> bool:
+    if item_type in _ACCOUNT_NEUTRAL_REPLAY_CONTEXT_ITEM_TYPES:
+        return _retained_context_item_is_replayable(item)
     if item_type in (None, "message"):
         allowed_fields = _ACCOUNT_NEUTRAL_MESSAGE_FIELDS
     elif item_type in _ACCOUNT_NEUTRAL_CONTENT_FIELDS:
@@ -1026,7 +1036,7 @@ def responses_payload_replay_rejection_reason(payload: Mapping[str, JsonValue]) 
         return lifecycle_rejection
     if not _input_items_have_valid_account_neutral_shape(input_items):
         return "input_content_shape"
-    if _contains_account_scoped_input_state(input_items):
+    if _contains_account_scoped_input_state(input_items, allow_retained_context=True):
         return "account_scoped_input"
 
     tools = payload.get("tools")
@@ -1247,11 +1257,40 @@ def _input_items_have_valid_account_neutral_shape(input_items: list[JsonValue]) 
             if item.get("role") != "developer" or not _tools_are_account_neutral(item.get("tools")):
                 return False
             continue
+        if item_type in _ACCOUNT_NEUTRAL_REPLAY_CONTEXT_ITEM_TYPES:
+            if not _retained_context_item_is_replayable(item):
+                return False
+            continue
         if item_type not in (None, "message"):
             continue
         if not _message_has_valid_account_neutral_content(item):
             return False
     return True
+
+
+def _retained_context_item_is_replayable(item: Mapping[str, JsonValue]) -> bool:
+    """Validate response-owned context we intentionally preserve on handoff.
+
+    The backend accepts these records across ChatGPT accounts, but their
+    contents are opaque and may evolve.  Keep their fields verbatim while
+    rejecting unfinished records and explicit account/resource references.
+    ``reasoning.encrypted_content`` is deliberately exempt from the generic
+    encrypted-content ownership check: it is the useful context under test.
+    """
+
+    item_type = item.get("type")
+    if item_type not in _ACCOUNT_NEUTRAL_REPLAY_CONTEXT_ITEM_TYPES:
+        return False
+    status = item.get("status")
+    if status is not None and status not in {"completed", "failed"}:
+        return False
+    if item_type == "reasoning":
+        encrypted = item.get("encrypted_content")
+        if not _is_nonblank_string(encrypted):
+            return False
+    elif status != "completed":
+        return False
+    return not _contains_account_scoped_input_state(item, allow_retained_context=True)
 
 
 def _message_has_valid_account_neutral_content(item: Mapping[str, JsonValue]) -> bool:
@@ -1315,12 +1354,26 @@ def _url_is_account_neutral(value: JsonValue | None, *, allow_data: bool) -> boo
     return scheme in ({"data", "http", "https"} if allow_data else {"http", "https"})
 
 
-def _contains_account_scoped_input_state(value: JsonValue) -> bool:
+def _contains_account_scoped_input_state(
+    value: JsonValue,
+    *,
+    allow_retained_context: bool = False,
+) -> bool:
     pending = [value]
     while pending:
         current = pending.pop()
         if isinstance(current, dict):
             item_type = current.get("type")
+            if allow_retained_context and item_type in _ACCOUNT_NEUTRAL_REPLAY_CONTEXT_ITEM_TYPES:
+                # The encrypted reasoning payload is intentionally retained;
+                # do not mistake its opaque ciphertext for an account-owned
+                # file/container reference while scanning nested values.
+                pending.extend(
+                    nested
+                    for key, nested in current.items()
+                    if key != "encrypted_content"
+                )
+                continue
             if item_type == "agent_message":
                 # Shape validation has already admitted only native plaintext
                 # or Responses-encrypted delivery shapes. Do not let
@@ -1508,7 +1561,11 @@ def transcript_is_source_free(view: PortabilityView, *, supported_tool_types: fr
     classification_view = _classification_view(view, supported_tool_types=supported_tool_types)
     if classification_view is None or not responses_payload_is_account_neutral_fresh_replay(classification_view):
         return False
-    return not any(_item_type(item) in ("compaction", "reasoning", "agent_message") for item in input_items)
+    return not any(
+        _item_type(item) in ("compaction", "reasoning", "agent_message")
+        or _item_type(item) in _ACCOUNT_NEUTRAL_REPLAY_CONTEXT_ITEM_TYPES
+        for item in input_items
+    )
 
 
 def is_binding_turn_state(headers: Mapping[str, str]) -> bool:

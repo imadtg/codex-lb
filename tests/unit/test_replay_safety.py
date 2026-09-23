@@ -151,7 +151,7 @@ def test_account_neutral_fresh_replay_accepts_self_contained_payloads(
     assert responses_payload_is_account_neutral_fresh_replay(payload) is True
 
 
-def test_account_neutral_replay_projection_removes_response_owned_bookkeeping() -> None:
+def test_account_neutral_replay_projection_preserves_context_and_unlinks_ids() -> None:
     metadata = {"turn_id": "turn_owner_a"}
     input_items: list[JsonValue] = [
         {
@@ -227,12 +227,18 @@ def test_account_neutral_replay_projection_removes_response_owned_bookkeeping() 
     projection = project_responses_input_for_account_neutral_fresh_replay(input_items, stored_count=3)
 
     assert projection is not None
-    assert projection.stored_prefix_count == 2
+    assert projection.stored_prefix_count == 3
     assert projection.input_items == [
         {
             "type": "message",
             "role": "user",
             "content": [{"type": "input_text", "text": "first question"}],
+            "internal_chat_message_metadata_passthrough": metadata,
+        },
+        {
+            "type": "reasoning",
+            "encrypted_content": "owner-a-ciphertext",
+            "summary": [],
             "internal_chat_message_metadata_passthrough": metadata,
         },
         {
@@ -247,6 +253,28 @@ def test_account_neutral_replay_projection_removes_response_owned_bookkeeping() 
             "type": "custom_tool_call_output",
             "call_id": "call_boundary",
             "output": "/workspace",
+            "status": "completed",
+            "internal_chat_message_metadata_passthrough": metadata,
+        },
+        {
+            "type": "tool_search_call",
+            "call_id": "call_search",
+            "arguments": {"query": "github"},
+            "execution": "client",
+            "status": "completed",
+            "internal_chat_message_metadata_passthrough": metadata,
+        },
+        {
+            "type": "tool_search_output",
+            "call_id": "call_search",
+            "execution": "client",
+            "status": "completed",
+            "tools": [],
+            "internal_chat_message_metadata_passthrough": metadata,
+        },
+        {
+            "type": "web_search_call",
+            "action": {"type": "search", "query": "github"},
             "status": "completed",
             "internal_chat_message_metadata_passthrough": metadata,
         },
@@ -282,6 +310,18 @@ def test_account_neutral_replay_projection_rejects_invalid_stored_boundary() -> 
         )
         is None
     )
+
+
+def test_account_neutral_replay_accepts_preserved_reasoning_and_completed_search_context() -> None:
+    payload = {
+        "input": [
+            {"type": "reasoning", "encrypted_content": "ciphertext", "summary": []},
+            {"type": "tool_search_call", "status": "completed", "arguments": {"query": "docs"}},
+            {"type": "tool_search_output", "status": "completed", "tools": []},
+            {"type": "web_search_call", "status": "completed", "action": {"type": "search"}},
+        ]
+    }
+    assert responses_payload_is_account_neutral_fresh_replay(payload) is True
 
 
 @pytest.mark.parametrize(
@@ -2181,7 +2221,6 @@ def test_full_resend_tool_loop_manifest_rejects_call_id_reused_from_unsupported_
         {"conversation": "conv_1", "input": []},
         {"previous_response_id": "resp_1", "input": []},
         {"prompt": {"id": "pmpt_1"}, "input": []},
-        {"input": [{"type": "reasoning", "encrypted_content": "ciphertext"}]},
         {"input": [{"type": "reasoning", "encrypted_content": 123}]},
         {"input": [{"type": "reasoning", "summary": [{"type": "summary_text", "text": "plan"}]}]},
         {"input": [{"type": "input_file", "file_id": "file_1"}]},

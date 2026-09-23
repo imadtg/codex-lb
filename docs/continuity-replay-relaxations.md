@@ -17,6 +17,7 @@ The detailed beta.8 comparison and source ledger remain in
 | The exact host `codex_app.automation_update` heartbeat can act as fresh input | Exact field set, heartbeat XML shape, finite timestamp, and no unsettled call | Upstream maintainer review evidence plus malformed-shape controls |
 | Encrypted collaboration `agent_message` delivery can move between ChatGPT accounts | Exactly `[input_text envelope, encrypted_content]`; ciphertext is nonblank and preserved verbatim; all response-owned item IDs and the old response anchor are removed | Direct OpenAI valid/corrupt experiment, Codex source, helper tests, and an HTTP-bridge regression |
 | A pre-visible permanent credential rejection releases a soft dispatch owner | Only an unanchored full resend may move; the handoff unlinks top-level source item IDs but preserves reasoning, search records, tool outputs, and nested values; previous-response, turn-state, and file owners remain strict | Read-only production trace reduction, two Free-to-Free Luna repetitions, and public-route regressions |
+| Completed reasoning and search records remain in an account handoff projection | The projection removes only top-level source item IDs; reasoning ciphertext must be nonblank, search records must be completed, and explicit file/container/vector-store/MCP references still reject the replay | 100-pair same-account control versus 100-pair cross-account Luna experiment |
 
 The first five allowances landed earlier in this fork. Commit `bdf3e5ef` adds
 the encrypted collaboration allowance. This ledger should gain a row whenever
@@ -104,6 +105,16 @@ The total variation distance was `0.70` and Jensen-Shannon divergence was
 `0.547` bits. ID-only unlinking and reasoning omission were similarly far from
 the source distribution, with total variation distance `0.71` each.
 
+A fair same-account control then used 100 shared prefixes and two independent
+continuations on the source account. It produced Pearson correlation `0.788`
+and exact agreement `91%` (means `55.04` and `54.63`). The paired
+cross-account run produced Pearson correlation `0.075` and exact agreement
+`13%` (means `51.20` and `23.14`). The approximately `0.713` drop is the
+relevant comparison: independent sampling explains why the same-account
+control is below 1.0, while cross-account continuation is close to
+unassociated with it. The redacted control artifact is
+[`docs/evidence/reasoning-number-same-same-luna-100.json`](evidence/reasoning-number-same-same-luna-100.json).
+
 This is the clearest evidence so far that the target does not reliably recover
 the same hidden committed number. The backend still accepted the reasoning
 ciphertext in the earlier controls and rejected corrupted ciphertext, so the
@@ -118,6 +129,23 @@ The rerunnable probe is
 It requires four environment variables for disposable source and target
 credentials, never reads the codex-lb database, and records no raw model text,
 tokens, ciphertext, or account IDs.
+
+## Compaction boundary
+
+On 2026-09-23, a direct `store: false` Luna request supplied a private marker,
+sent the complete prefix through `compaction_trigger`, and continued with only
+the returned `compaction` item. OpenAI returned HTTP 200 for both operations;
+the continuation recovered the marker exactly. The compaction output contained
+an opaque 1,484-byte `encrypted_content` field. The redacted result is
+[`docs/evidence/compaction-memory-luna-2026-09-23.json`](evidence/compaction-memory-luna-2026-09-23.json).
+
+This establishes that compaction output is essential retained context on its
+origin account. It does not establish that a compaction item can be projected
+to another account, so the replay gate continues to keep compaction history
+owner-bound until a separate cross-account valid/corrupt experiment proves
+otherwise. The new reasoning/search relaxation therefore preserves validated
+completed records but does not broaden the gate for compaction, hosted state,
+files, turn state, or prior-response anchors.
 
 ## Encrypted collaboration experiment
 

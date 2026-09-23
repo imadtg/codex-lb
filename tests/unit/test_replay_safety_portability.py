@@ -633,7 +633,11 @@ def test_portable_implies_account_neutral_fresh_replay(
         if verdict.reason == "turn_state_bound":
             assert source_free and is_binding_turn_state(headers)
     assert source_free == (
-        neutral and not any(_item_type(item) in ("reasoning", "compaction") for item in _items(view))
+        neutral
+        and not any(
+            _item_type(item) in ("reasoning", "compaction", "tool_search_call", "tool_search_output", "web_search_call")
+            for item in _items(view)
+        )
     )
 
 
