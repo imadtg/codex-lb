@@ -8,7 +8,11 @@ import pytest
 from app.core.balancer import AccountState
 from app.core.utils.request_id import reset_request_id, set_request_id
 from app.db.models import AccountStatus
-from app.modules.proxy.continuity_diagnostics import correlation_hash, record_candidate_states
+from app.modules.proxy.continuity_diagnostics import (
+    correlation_hash,
+    record_candidate_states,
+    record_tool_output_delta_observation,
+)
 from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
 
 pytestmark = pytest.mark.unit
@@ -22,7 +26,7 @@ pytestmark = pytest.mark.unit
         ({"SECRET": "SECRET"}, "unknown_payload_field"),
         ({"previous_response_id": "SECRET"}, "previous_response_bound"),
         ({"tools": [{"type": "SECRET"}]}, "tool_declarations"),
-        ({"input": [{"type": "compaction", "encrypted_content": "SECRET"}]}, "input_item_type"),
+        ({"input": [{"type": "compaction", "encrypted_content": "SECRET"}]}, "accepted"),
         (
             {"input": [{"type": "function_call_output", "call_id": "SECRET", "output": "SECRET"}]},
             "input_tool_output_unmatched_or_invalid",
@@ -89,6 +93,27 @@ def test_disabled_logging_does_not_change_classification(caplog):
     caplog.set_level(logging.WARNING, logger="app.modules.proxy.continuity")
     assert responses_payload_is_account_neutral_fresh_replay({"input": "private"})
     assert not caplog.records
+
+
+def test_tool_output_delta_observation_is_content_free(caplog):
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.continuity")
+    token = set_request_id("SECRET-request")
+    try:
+        record_tool_output_delta_observation(
+            previous_response_id="SECRET-response",
+            input_item_count=2,
+            tool_call_count=0,
+            tool_output_count=1,
+            full_resend_retry_safe=False,
+        )
+    finally:
+        reset_request_id(token)
+    assert len(caplog.records) == 1
+    assert "continuity_tool_output_delta version=1" in caplog.text
+    assert "tool_calls=0" in caplog.text
+    assert "tool_outputs=1" in caplog.text
+    assert "full_resend_retry_safe=False" in caplog.text
+    assert "SECRET" not in caplog.text
 
 
 @pytest.mark.parametrize("json_log", [False, True])

@@ -375,3 +375,29 @@ def record_retry_ownership(
         owner_excluded,
         response_events,
     )
+
+
+def record_tool_output_delta_observation(
+    *,
+    previous_response_id: str,
+    input_item_count: int,
+    tool_call_count: int,
+    tool_output_count: int,
+    full_resend_retry_safe: bool,
+) -> None:
+    """Make owner-bound local-tool follow-ups distinguishable in telemetry.
+
+    This records shape only. It lets a later incident answer whether the
+    client supplied a call/output delta instead of a complete replay body,
+    without logging tool arguments, output, response IDs, or account IDs.
+    """
+    _emit(
+        "continuity_tool_output_delta version=1 request=%s previous_response=%s "
+        "input_items=%s tool_calls=%s tool_outputs=%s full_resend_retry_safe=%s",
+        correlation_hash(get_request_id()),
+        correlation_hash(previous_response_id),
+        input_item_count,
+        tool_call_count,
+        tool_output_count,
+        full_resend_retry_safe,
+    )

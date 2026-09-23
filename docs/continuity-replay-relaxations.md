@@ -85,6 +85,22 @@ The stable findings were:
 
 The redacted machine-readable evidence is
 [`docs/evidence/cross-account-context-portability-2026-09-22.json`](evidence/cross-account-context-portability-2026-09-22.json).
+
+Because the two-run web-search result was potentially confounded by sampling,
+the same protocol was repeated on 2026-09-23 with twelve continuations per
+variant and with tools disabled on every continuation. The source prefix was
+searched once, then the exact title was requested from: twelve same-account
+controls, twelve cross-account continuations with the complete retained
+history, and twelve cross-account continuations with only the
+`web_search_call` removed. All 36 continuations completed. The same-account
+control produced one dominant answer hash in all twelve runs. The cross-account
+full-history and omitted-search variants each produced a different, stable
+answer hash in all twelve runs, and those two cross-account distributions were
+identical. This is strong evidence that the search record affects the
+origin-account continuation but was not recovered equivalently by the target
+account in this test; it is not evidence that the record should be deleted.
+The redacted artifact is
+[`docs/evidence/web-search-portability-luna-12x-no-tools-2026-09-23.json`](evidence/web-search-portability-luna-12x-no-tools-2026-09-23.json).
 The repeated reasoning controls are recorded in
 [`docs/evidence/cross-account-reasoning-repeatability-2026-09-22.json`](evidence/cross-account-reasoning-repeatability-2026-09-22.json).
 

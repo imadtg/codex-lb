@@ -330,6 +330,7 @@ from app.modules.proxy._service.observability import (
 from app.modules.proxy._service.observability import (
     _truncate_identifier as _truncate_identifier,
 )
+from app.modules.proxy.continuity_diagnostics import record_tool_output_delta_observation
 from app.modules.proxy._service.support import (
     _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE,
     _HARD_HTTP_BRIDGE_AFFINITY_KINDS,  # noqa: F401
@@ -3282,6 +3283,25 @@ class _WebSocketMixin:
                     "client_metadata": full_resend_client_metadata,
                 }
             )
+        if responses_payload.previous_response_id is not None and isinstance(responses_payload.input, list):
+            tool_call_types = {"function_call", "custom_tool_call", "apply_patch_call"}
+            tool_output_types = {"function_call_output", "custom_tool_call_output", "apply_patch_call_output"}
+            tool_calls = sum(
+                isinstance(item, dict) and item.get("type") in tool_call_types
+                for item in responses_payload.input
+            )
+            tool_outputs = sum(
+                isinstance(item, dict) and item.get("type") in tool_output_types
+                for item in responses_payload.input
+            )
+            if tool_outputs:
+                record_tool_output_delta_observation(
+                    previous_response_id=responses_payload.previous_response_id,
+                    input_item_count=len(responses_payload.input),
+                    tool_call_count=tool_calls,
+                    tool_output_count=tool_outputs,
+                    full_resend_retry_safe=client_full_resend_retry_safe,
+                )
         validate_model_access(refreshed_api_key, responses_payload.model)
         proxy._raise_for_unsupported_input_image_references(responses_payload)
         rewritten_file_account_id = await proxy._resolve_file_account_for_responses(responses_payload, headers)

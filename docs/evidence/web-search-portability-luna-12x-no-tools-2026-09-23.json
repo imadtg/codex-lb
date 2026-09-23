@@ -1,0 +1,60 @@
+{
+  "account_relation": "two active accounts; IDs omitted",
+  "client_version": "0.156.0",
+  "endpoint": "https://chatgpt.com/backend-api/codex/responses",
+  "model": "gpt-5.6-luna",
+  "observed_at": "2026-09-23T10:14:47.038094+00:00",
+  "privacy": {
+    "contains_access_token": false,
+    "contains_account_identifier": false,
+    "contains_raw_ciphertext": false,
+    "contains_raw_model_text": false
+  },
+  "query": "current first headline on OpenAI News page",
+  "repetitions_per_variant": 12,
+  "request_invariants": {
+    "previous_response_id": false,
+    "store": false,
+    "via_codex_lb": false
+  },
+  "schema_version": 1,
+  "source_output_types": [
+    "reasoning",
+    "web_search_call",
+    "reasoning",
+    "message"
+  ],
+  "source_status": 200,
+  "variants": {
+    "different_account_full": {
+      "completed": 12,
+      "error_codes": {},
+      "hash_counts": {
+        "c2e3ac47f4a325469c1a2d5f117e463ec943c721986d5d9f09ac4540b7d80526": 12
+      },
+      "mode_count": 12,
+      "n": 12,
+      "unique_text_hashes": 1
+    },
+    "different_account_omit_web_search": {
+      "completed": 12,
+      "error_codes": {},
+      "hash_counts": {
+        "c2e3ac47f4a325469c1a2d5f117e463ec943c721986d5d9f09ac4540b7d80526": 12
+      },
+      "mode_count": 12,
+      "n": 12,
+      "unique_text_hashes": 1
+    },
+    "same_account_full": {
+      "completed": 12,
+      "error_codes": {},
+      "hash_counts": {
+        "b19842a3bf4098794780ce54693bf81526981be10297ad4c518eb754f82369a1": 12
+      },
+      "mode_count": 12,
+      "n": 12,
+      "unique_text_hashes": 1
+    }
+  }
+}
