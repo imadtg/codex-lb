@@ -9085,6 +9085,172 @@ async def test_backend_responses_soft_prompt_cache_follow_up_uses_durable_owner_
 
 
 @pytest.mark.parametrize(
+    "handoff_shape",
+    [
+        pytest.param("developer-preface", id="final-developer-user"),
+        pytest.param("reasoning-tool", id="reasoning-commentary-settled-tool-user"),
+        pytest.param("reasoning-tool-missing-output", id="reasoning-tool-without-result-stays-bound"),
+        pytest.param("developer-preface-incomplete", id="incomplete-assistant-stays-bound"),
+        pytest.param("developer-preface-null-metadata", id="null-metadata-stays-bound"),
+        pytest.param("reasoning-tool-invalid-reasoning", id="invalid-reasoning-stays-bound"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_backend_hard_thread_resends_complete_context_when_owner_exhausts(
+    async_client, monkeypatch, handoff_shape
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    owner_id = await _import_account(async_client, "acc_hard_resend_owner", "hard-resend-owner@example.com")
+    alternate_id = await _import_account(async_client, "acc_hard_resend_alternate", "hard-resend-alternate@example.com")
+    owner = await _get_account(owner_id)
+    alternate = await _get_account(alternate_id)
+    owner_upstream = (
+        _ClosingInterruptedCustomToolUpstreamWebSocket()
+        if handoff_shape.startswith("reasoning-tool")
+        else _ClosingBridgeUpstreamWebSocket("resp_owner")
+    )
+    alternate_upstream = _FakeBridgeUpstreamWebSocket("resp_alternate")
+    connected: list[str] = []
+
+    async def select_account(self, deadline, **kwargs):
+        del self, deadline
+        if kwargs.get("preferred_account_id") == owner.id and not kwargs.get(
+            "fallback_on_preferred_account_unavailable", True
+        ):
+            return AccountSelection(None, "Owner quota exhausted", CONTINUITY_OWNER_UNAVAILABLE)
+        if kwargs.get("preferred_account_id") == alternate.id or owner.id in (
+            kwargs.get("exclude_account_ids") or set()
+        ):
+            return AccountSelection(alternate, None, None)
+        return AccountSelection(owner, None, None)
+
+    async def fresh_account(self, account, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return account
+
+    async def connect(headers, access_token, account_id_header, *, base_url=None, session=None):
+        del headers, access_token, base_url, session
+        connected.append(account_id_header)
+        if account_id_header == owner.chatgpt_account_id:
+            return owner_upstream
+        assert account_id_header == alternate.chatgpt_account_id
+        return alternate_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", select_account)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fresh_account)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", connect)
+
+    headers = {"thread-id": f"hard-resend-{handoff_shape}", "session_id": f"session-{handoff_shape}"}
+    initial_input = [
+        {"type": "additional_tools", "role": "developer", "tools": [{"type": "custom", "name": "shell"}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "first question"}]},
+    ]
+    first = await async_client.post(
+        "/backend-api/codex/responses",
+        headers=headers,
+        json={"model": "gpt-5.1", "input": initial_input, "prompt_cache_key": "soft-cache"},
+    )
+    assert first.status_code == 200, first.text
+    assert "response.completed" in first.text
+
+    if handoff_shape.startswith("developer-preface"):
+        suffix = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "status": "completed",
+                "id": "msg_prior",
+                "content": [{"type": "output_text", "text": "first answer"}],
+            },
+            {
+                "type": "message",
+                "role": "developer",
+                "id": "msg_fresh_control",
+                "content": [{"type": "input_text", "text": "fresh control"}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "id": "msg_fresh_user",
+                "content": [{"type": "input_text", "text": "second question"}],
+            },
+        ]
+    else:
+        # Shape from Redarchy's failed operation: an intact encrypted reasoning
+        # item precedes commentary and a fully settled persisted tool call.
+        suffix = [
+            {
+                "type": "reasoning",
+                "id": "rs_prior",
+                "status": "completed",
+                "encrypted_content": "opaque-reasoning-to-retain",
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "id": "msg_prior",
+                "content": [{"type": "output_text", "text": "running shell"}],
+            },
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_prior",
+                "status": "completed",
+                "call_id": "call_custom_shell",
+                "name": "shell",
+                "input": "pwd",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "id": "ctco_prior",
+                "call_id": "call_custom_shell",
+                "output": "/workspace",
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "id": "msg_fresh_user",
+                "content": [{"type": "input_text", "text": "second question"}],
+            },
+        ]
+    if handoff_shape == "reasoning-tool-missing-output":
+        suffix = [item for item in suffix if item.get("type") != "custom_tool_call_output"]
+    if handoff_shape == "reasoning-tool-invalid-reasoning":
+        suffix[0]["encrypted_content"] = ""
+    if handoff_shape == "developer-preface-null-metadata":
+        suffix[1]["metadata"] = None
+    if handoff_shape == "developer-preface-incomplete":
+        suffix[0]["phase"] = "commentary"
+    second = await async_client.post(
+        "/backend-api/codex/responses",
+        headers=headers,
+        json={"model": "gpt-5.1", "input": [*initial_input, *suffix], "prompt_cache_key": "soft-cache"},
+    )
+    if handoff_shape in {
+        "reasoning-tool-missing-output",
+        "reasoning-tool-invalid-reasoning",
+        "developer-preface-incomplete",
+        "developer-preface-null-metadata",
+    }:
+        assert second.status_code == 502, second.text
+        assert second.json()["error"]["code"] == "previous_response_owner_unavailable"
+        assert connected == [owner.chatgpt_account_id]
+        assert alternate_upstream.sent_text == []
+        return
+    assert second.status_code == 200, second.text
+    assert "response.completed" in second.text
+    assert connected == [owner.chatgpt_account_id, alternate.chatgpt_account_id]
+    assert len(owner_upstream.sent_text) == 1
+    assert len(alternate_upstream.sent_text) == 1
+    replay = json.loads(alternate_upstream.sent_text[0])
+    assert not replay.get("previous_response_id")
+    assert replay["input"] == [
+        {key: value for key, value in item.items() if key != "id"} for item in [*initial_input, *suffix]
+    ]
+
+
+@pytest.mark.parametrize(
     "fresh_developer_followup",
     [
         pytest.param(False, id="ordinary-user-followup"),
@@ -9934,7 +10100,7 @@ async def test_backend_responses_http_bridge_declines_cross_account_anchor_and_s
 
 
 @pytest.mark.asyncio
-async def test_backend_responses_projects_retained_encrypted_reasoning_before_replaying_to_available_account(
+async def test_backend_responses_retains_encrypted_reasoning_before_replaying_to_available_account(
     async_client,
     monkeypatch,
 ):
@@ -10043,9 +10209,10 @@ async def test_backend_responses_projects_retained_encrypted_reasoning_before_re
     assert len(alternate_upstream.sent_text) == 1
     replay_payload = json.loads(alternate_upstream.sent_text[0])
     assert "previous_response_id" not in replay_payload
-    assert all(item.get("type") not in {"reasoning", "web_search_call"} for item in replay_payload["input"])
-    assert all("id" not in item for item in replay_payload["input"])
-    assert "encrypted_content" not in alternate_upstream.sent_text[0]
+    assert replay_payload["input"] == [
+        {key: value for key, value in item.items() if key != "id"} for item in full_resend
+    ]
+    assert "owner-scoped-ciphertext" in alternate_upstream.sent_text[0]
     assert degraded_reasons == []
 
 

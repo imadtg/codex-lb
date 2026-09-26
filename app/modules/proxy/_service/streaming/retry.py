@@ -114,8 +114,8 @@ from app.modules.proxy.http_continuation import http_continuation_signal
 from app.modules.proxy.load_balancer import AccountLease, AccountSelection
 from app.modules.proxy.replay_safety import (
     project_unanchored_account_neutral_input,
+    project_unanchored_plaintext_history,
     responses_payload_is_account_neutral_fresh_replay,
-    strip_input_item_ids,
 )
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
 
@@ -204,6 +204,24 @@ def _verified_cross_transport_fresh_replay(
 def _project_unanchored_account_neutral_replay(payload: ResponsesRequest) -> ResponsesRequest | None:
     input_items = project_unanchored_account_neutral_input(payload.to_replay_safety_payload())
     return payload.model_copy(update={"input": input_items}) if input_items is not None else None
+
+
+def _project_previsible_rejection_replay(payload: ResponsesRequest) -> ResponsesRequest | None:
+    """Keep a complete first turn or a proven full resend; reject orphan deltas."""
+    if not isinstance(payload.input, list):
+        return (
+            payload if responses_payload_is_account_neutral_fresh_replay(payload.to_replay_safety_payload()) else None
+        )
+    raw = payload.to_replay_safety_payload()
+    projected_input = project_unanchored_plaintext_history(raw)
+    if projected_input is None:
+        projected_input = project_unanchored_account_neutral_input(raw)
+    if projected_input is None:
+        return None
+    candidate = payload.model_copy(update={"input": projected_input})
+    return (
+        candidate if responses_payload_is_account_neutral_fresh_replay(candidate.to_replay_safety_payload()) else None
+    )
 
 
 def _effective_http_downstream_transport_policy(
@@ -976,7 +994,7 @@ class _StreamingRetryMixin:
 
             The dispatch anchor is provisional until upstream accepts the
             request.  Once that account rejects the request before any output,
-            the exact unanchored request may move to another account. This
+            a self-contained unanchored request may move to another account. This
             applies equally to quota and permanently revoked credentials;
             neither rejection creates response-owned state on the failed
             account. Retained reasoning and search bookkeeping are model
@@ -993,8 +1011,10 @@ class _StreamingRetryMixin:
                 or routing_strategy == "single_account"
             ):
                 return False
-            if isinstance(payload.input, list):
-                payload = payload.model_copy(update={"input": strip_input_item_ids(payload.input)})
+            candidate = _project_previsible_rejection_replay(payload)
+            if candidate is None:
+                return False
+            payload = candidate
             payload_replay_required_account_id = None
             affinity = replace(affinity, reallocate_sticky=True)
             record_continuity_decision(stage=decision_stage, reason="context_preserving_replay_eligible")
@@ -1006,17 +1026,15 @@ class _StreamingRetryMixin:
             )
             return True
 
-        def _move_previsible_account_rejection_from_dispatch_owner(
-            *, account_id: str, outcome: str
-        ) -> bool:
+        def _move_previsible_account_rejection_from_dispatch_owner(*, account_id: str, outcome: str) -> bool:
             """Move a fresh first-turn body after a pre-visible account rejection.
 
             Once the stream has yielded a pre-created ``response.failed`` event,
             the dispatch account is recorded as the provisional payload owner.
             Permanent account-local failures (revoked credentials, deactivated
             accounts, and similar authentication failures) prove that no turn
-            was created, so the exact unanchored body may be retried on a
-            different eligible account. Hard continuity owners remain pinned.
+            was created, so a self-contained unanchored body may be retried on
+            a different eligible account. Hard continuity owners remain pinned.
             Caller history is preserved at the parsed JSON level apart from
             unlinking source-minted top-level item IDs: reasoning, search
             records, and every nested value remain model context.
@@ -1034,8 +1052,10 @@ class _StreamingRetryMixin:
             ):
                 return False
 
-            if isinstance(payload.input, list):
-                payload = payload.model_copy(update={"input": strip_input_item_ids(payload.input)})
+            candidate = _project_previsible_rejection_replay(payload)
+            if candidate is None:
+                return False
+            payload = candidate
             payload_replay_required_account_id = None
             excluded_account_ids.add(account_id)
             if preferred_account_id == account_id:
@@ -2759,15 +2779,12 @@ class _StreamingRetryMixin:
                                     and code in PERMANENT_FAILURE_CODES
                                     and attempt < max_attempts - 1
                                 ):
-                                    permanent_account_rejection_replay = (
-                                        _move_verified_fresh_replay_from_owner(
-                                            account_id=account.id,
-                                            outcome="owner_previsible_permanent_account_rejection",
-                                        )
-                                        or _move_previsible_account_rejection_from_dispatch_owner(
-                                            account_id=account.id,
-                                            outcome="owner_previsible_permanent_account_rejection",
-                                        )
+                                    permanent_account_rejection_replay = _move_verified_fresh_replay_from_owner(
+                                        account_id=account.id,
+                                        outcome="owner_previsible_permanent_account_rejection",
+                                    ) or _move_previsible_account_rejection_from_dispatch_owner(
+                                        account_id=account.id,
+                                        outcome="owner_previsible_permanent_account_rejection",
                                     )
                                 if resilience.deterministic_failover_enabled:
                                     action = (

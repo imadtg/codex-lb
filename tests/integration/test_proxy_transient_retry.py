@@ -1880,12 +1880,8 @@ async def test_stream_first_event_429_with_owner_state_transparently_fails_over(
         "reasoning",
         "message",
     ]
-    assert [item.get("type") for item in second_input if isinstance(item, dict)] == [
-        "message",
-        "message",
-        "message",
-    ]
-    assert all(isinstance(item, dict) and "id" not in item for item in second_input)
+    assert second_input == [{key: value for key, value in item.items() if key != "id"} for item in first_input]
+    assert second_input[2]["encrypted_content"] == "owner-bound"
 
 
 @pytest.mark.asyncio
@@ -2019,7 +2015,7 @@ async def test_stream_previsible_429_replays_scheduled_heartbeat_on_another_acco
     replay_input = seen_inputs[1]
     assert isinstance(replay_input, list)
     assert all(isinstance(item, dict) and "id" not in item for item in replay_input)
-    assert all(item.get("type") != "reasoning" for item in replay_input if isinstance(item, dict))
+    assert replay_input == [{key: value for key, value in item.items() if key != "id"} for item in payload["input"]]
     replay_message_roles = [
         item.get("role") for item in replay_input if isinstance(item, dict) and item.get("type") in (None, "message")
     ]

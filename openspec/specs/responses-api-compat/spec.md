@@ -6112,11 +6112,14 @@ fresh positions defined below. Every other developer position or shape MUST
 remain fail-closed.
 
 A tolerated fresh developer message MUST have `type` omitted or equal to `message`,
-MUST have role `developer`, MUST have no non-empty response-owned ID or phase,
-MUST have no status or a `completed` status, MUST contain exact account-neutral
-metadata with one nonblank `turn_id`, MUST contain exactly one self-contained
-`input_text` content part, and MUST contain no unknown or account-scoped fields.
-Explicit null or malformed item types MUST fail closed.
+MUST have role `developer`, MUST have no phase, MUST have no status or a
+`completed` status, MUST contain exactly one self-contained `input_text` content
+part, and MUST contain no unknown or account-scoped fields. The terminal
+user-then-developer shape MUST have no non-empty response-owned ID and MUST
+contain exact account-neutral metadata with one nonblank `turn_id`. The
+completed-final-answer, developer-before-user shape MAY have a top-level
+response-owned ID and MAY lack metadata, but any present metadata MUST be
+account-neutral. Explicit null or malformed item types MUST fail closed.
 
 Classification MUST retain response-owned developer-message ID evidence until
 these checks have completed, even when other response-owned IDs are projected
@@ -6215,8 +6218,18 @@ top-level `instructions` remain outside this requirement.
 #### Scenario: Unproven retained-output developer follow-up remains fail-closed
 
 - **GIVEN** a retained-output full resend
-- **WHEN** the latest assistant output is not `final_answer`, the developer message is not terminal, the fresh input is raw or contains multiple user items, the developer metadata or content is not account-neutral, or the stored prefix contains historical developer interleaving
+- **WHEN** the latest assistant output is not `final_answer`, the developer message violates both the terminal follow-up and single-user preface bounds, the fresh input is raw or contains multiple user items, the developer metadata or content is not account-neutral, or the stored prefix contains historical developer interleaving
 - **THEN** retained-output proof fails
+
+#### Scenario: Bounded developer preface before fresh user survives handoff
+- **GIVEN** a fingerprint-verified stored prefix is followed by a completed assistant `final_answer`
+- **WHEN** one valid developer instruction with a top-level item ID precedes exactly one fresh user message
+- **THEN** retained-output proof passes
+- **AND** cross-account replay retains the instruction content while unlinking only its top-level ID
+
+#### Scenario: Incomplete answer before developer preface remains owner-bound
+- **WHEN** the assistant response before a developer preface is not a completed `final_answer`
+- **THEN** retained-output proof fails even if a fresh user message follows
 
 ### Requirement: Aborted terminal bookkeeping settles claimed reservations exactly once
 
@@ -10916,3 +10929,33 @@ opaque content and incomplete tool settlement SHALL remain ineligible.
 #### Scenario: Commentary precedes an incomplete or opaque batch
 - **WHEN** any persisted output is missing or the commentary contains opaque content
 - **THEN** quota handoff remains unavailable
+
+### Requirement: Exact tool-manifest proof preserves validated response context
+
+When a fingerprint-verified full resend exactly settles the persisted response-bound tool-call manifest, the proof SHALL allow validated reasoning, compaction, and search records outside the call/output batch without treating those records as calls or outputs. The replayed request SHALL retain these context records byte-identically except for their top-level response-owned IDs. Invalid or unfinished context records and missing or mismatched tool outputs SHALL remain ineligible for handoff.
+
+#### Scenario: Encrypted reasoning precedes a settled tool batch
+- **GIVEN** the durable prior response records exactly one pending custom tool call
+- **AND** the client resends encrypted reasoning, completed commentary, that call and its matching output, then a fresh user message
+- **WHEN** the hard owner is unavailable and another ChatGPT account is eligible
+- **THEN** the proxy replays the complete context on the alternate account once
+- **AND** the reasoning ciphertext, commentary, call, output, and user message retain their content
+
+#### Scenario: Incomplete tool batch remains owner-bound
+- **GIVEN** retained reasoning and commentary accompany a persisted pending tool call
+- **WHEN** its matching output is missing or the reasoning record is invalid
+- **THEN** the proxy does not dispatch the continuation on another account
+
+### Requirement: Pre-visible account rejection does not move unsettled history
+
+When an ordinary HTTP response attempt is rejected for quota or a permanent account-local error before output, a soft-owner handoff SHALL revalidate the candidate full input after removing only top-level response-owned item IDs. The handoff SHALL occur only when the resulting request is account-neutral and self-contained. An unmatched or unresolved tool call SHALL remain ineligible; a settled tool call and its output MAY be replayed together without losing either item.
+
+#### Scenario: Quota rejection preserves complete tool history
+- **GIVEN** a full input contains a tool call and its matching completed output
+- **WHEN** the first account explicitly rejects before response creation
+- **THEN** an eligible alternate account may receive the complete call and output exactly once
+
+#### Scenario: Quota rejection cannot hand off an unsettled tool call
+- **GIVEN** a full input contains a tool call without its matching output
+- **WHEN** the first account explicitly rejects before response creation
+- **THEN** no alternate account receives that incomplete history

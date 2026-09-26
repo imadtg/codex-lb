@@ -511,6 +511,7 @@ def responses_input_suffix_retains_prior_output(
     fresh_followup_count = 0
     fresh_followup_is_user_message = False
     fresh_developer_followup_seen = False
+    fresh_developer_preface_seen = False
     for item in input_items[stored_count:]:
         if fresh_developer_followup_seen or not isinstance(item, dict):
             return False
@@ -518,6 +519,26 @@ def responses_input_suffix_retains_prior_output(
         if "type" in item and not _is_nonblank_string(item_type_value):
             return False
         item_type = item_type_value if isinstance(item_type_value, str) else None
+        if fresh_developer_preface_seen:
+            # This instruction starts exactly one new user turn.
+            if fresh_followup_seen or item_type not in (None, "message") or item.get("role") != "user":
+                return False
+            if not _is_fresh_followup_input(item):
+                return False
+            fresh_followup_seen = True
+            fresh_followup_count = 1
+            fresh_followup_is_user_message = True
+            continue
+        if (
+            item.get("role") == "developer"
+            and _fresh_developer_message_is_transparent(item, allow_response_owned_id=True, allow_missing_metadata=True)
+            and retained_output_seen
+            and retained_output_is_final_answer
+            and not fresh_followup_seen
+            and not pending_suffix_calls
+        ):
+            fresh_developer_preface_seen = True
+            continue
         if _is_host_automation_heartbeat_input(item):
             if not retained_output_seen or pending_suffix_calls:
                 return False
@@ -659,14 +680,20 @@ def responses_input_suffix_matches_pending_tool_calls(
         ):
             return False
     suffix = suffix[:first_followup]
-    # Codex may retain an assistant commentary message immediately before the
-    # persisted tool-call batch.  It is safe only when it is an ordinary,
-    # non-final commentary message with no tool identity or opaque metadata;
-    # the exact call/output manifest below remains mandatory.
+    # Reasoning and search records are retained in the outgoing replay.  For
+    # this proof alone they are context, not members of the exact tool batch.
+    # Only validated context can be ignored while comparing calls
+    # against the durable response-bound manifest.
     suffix = [
         item
         for item in suffix
         if not (
+            isinstance(item, dict)
+            and isinstance(item.get("type"), str)
+            and item["type"] in _ACCOUNT_NEUTRAL_REPLAY_CONTEXT_ITEM_TYPES
+            and _retained_context_item_is_replayable(item)
+        )
+        and not (
             isinstance(item, dict)
             and item.get("type") == "message"
             and item.get("role") == "assistant"
@@ -842,6 +869,9 @@ def _fresh_developer_interleave_is_bounded(
 
 def _fresh_developer_message_is_transparent(
     item: Mapping[str, JsonValue],
+    *,
+    allow_response_owned_id: bool = False,
+    allow_missing_metadata: bool = False,
 ) -> bool:
     item_type_value = item.get("type")
     item_type = item_type_value if isinstance(item_type_value, str) else None
@@ -851,11 +881,13 @@ def _fresh_developer_message_is_transparent(
         ("type" not in item or _is_nonblank_string(item.get("type")))
         and item_type in (None, "message")
         and item.get("role") == "developer"
-        and item.get("id") in (None, "")
+        and (item.get("id") in (None, "") or (allow_response_owned_id and _is_nonblank_string(item.get("id"))))
         and item.get("phase") is None
         and item.get("status") in (None, "completed")
-        and isinstance(metadata, dict)
-        and _internal_chat_message_metadata_is_account_neutral(metadata)
+        and (
+            (allow_missing_metadata and _INTERNAL_CHAT_MESSAGE_METADATA_FIELD not in item)
+            or (isinstance(metadata, dict) and _internal_chat_message_metadata_is_account_neutral(metadata))
+        )
         and _input_item_has_only_known_fields(item, item_type)
         and isinstance(content, list)
         and len(content) == 1
@@ -1370,11 +1402,7 @@ def _contains_account_scoped_input_state(
                 # The encrypted reasoning payload is intentionally retained;
                 # do not mistake its opaque ciphertext for an account-owned
                 # file/container reference while scanning nested values.
-                pending.extend(
-                    nested
-                    for key, nested in current.items()
-                    if key != "encrypted_content"
-                )
+                pending.extend(nested for key, nested in current.items() if key != "encrypted_content")
                 continue
             if item_type == "agent_message":
                 # Shape validation has already admitted only native plaintext
