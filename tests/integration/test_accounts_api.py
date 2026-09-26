@@ -14,6 +14,8 @@ from app.core.crypto import TokenEncryptor
 from app.core.usage.models import UsagePayload
 from app.db.models import Account, AccountStatus
 from app.db.session import SessionLocal
+from app.modules.api_keys.repository import ApiKeysRepository
+from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService
 from app.modules.rate_limit_reset_credits.store import get_rate_limit_reset_credits_store
 
 pytestmark = pytest.mark.integration
@@ -70,6 +72,53 @@ async def test_import_and_list_accounts(async_client):
     accounts = list_response.json()["accounts"]
     account = next(account for account in accounts if account["accountId"] == expected_account_id)
     assert "usageRefreshedAt" not in account
+
+
+@pytest.mark.asyncio
+async def test_proxy_management_accounts_requires_and_honors_api_key_scope(async_client):
+    imported_ids = []
+    for suffix in ("visible", "hidden"):
+        email = f"proxy-management-{suffix}@example.com"
+        raw_account_id = f"acc_proxy_management_{suffix}"
+        auth_json = {
+            "tokens": {
+                "idToken": _encode_jwt({
+                    "email": email,
+                    "chatgpt_account_id": raw_account_id,
+                    "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+                }),
+                "accessToken": f"access-{suffix}",
+                "refreshToken": f"refresh-{suffix}",
+                "accountId": raw_account_id,
+            },
+        }
+        response = await async_client.post(
+            "/api/accounts/import",
+            files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")},
+        )
+        assert response.status_code == 200
+        imported_ids.append(response.json()["accountId"])
+
+    async with SessionLocal() as session:
+        created = await ApiKeysService(ApiKeysRepository(session)).create_key(
+            ApiKeyCreateData(
+                name="proxy-management-test",
+                allowed_models=None,
+                assigned_account_ids=[imported_ids[0]],
+            ),
+        )
+
+    missing = await async_client.get("/api/proxy-management/accounts")
+    assert missing.status_code == 401
+
+    response = await async_client.get(
+        "/api/proxy-management/accounts",
+        headers={"Authorization": f"Bearer {created.key}"},
+    )
+    assert response.status_code == 200
+    accounts = response.json()["accounts"]
+    assert [account["accountId"] for account in accounts] == [imported_ids[0]]
+    assert accounts[0]["email"] == "proxy-management-visible@example.com"
 
 
 @pytest.mark.asyncio

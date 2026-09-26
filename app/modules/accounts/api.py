@@ -10,6 +10,7 @@ from app.core.auth.dependencies import (
     require_dashboard_permission,
     set_dashboard_error_format,
     validate_dashboard_session,
+    validate_required_proxy_api_key,
 )
 from app.core.auth.refresh import RefreshError
 from app.core.clients.usage import UsageFetchError
@@ -54,6 +55,7 @@ from app.modules.accounts.service import (
     AccountUsageResetCreditsUnavailableError,
     InvalidAuthJsonError,
 )
+from app.modules.api_keys.service import ApiKeyData
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,11 @@ router = APIRouter(
     prefix="/api/accounts",
     tags=["dashboard"],
     dependencies=[Depends(validate_dashboard_session), Depends(set_dashboard_error_format)],
+)
+
+proxy_management_router = APIRouter(
+    prefix="/api/proxy-management/accounts",
+    tags=["proxy-management"],
 )
 
 _ACCOUNT_IMPORT_OPENAPI_EXTRA = {
@@ -104,6 +111,21 @@ async def list_accounts(
     accounts = await context.service.list_accounts(
         redact_identity=not principal.has(Permission.ACCOUNTS_WRITE),
     )
+    return AccountsResponse(accounts=accounts)
+
+
+@proxy_management_router.get("", response_model=AccountsResponse)
+async def list_proxy_management_accounts(
+    api_key: ApiKeyData = Depends(validate_required_proxy_api_key),
+    context: AccountsContext = Depends(get_accounts_context),
+) -> AccountsResponse:
+    """Expose account usage metadata to an authenticated local integration.
+
+    Account-scoped API keys only see their assigned accounts. This endpoint
+    deliberately returns summaries and never exports OAuth credentials.
+    """
+    account_ids = api_key.assigned_account_ids if api_key.account_assignment_scope_enabled else None
+    accounts = await context.service.list_accounts(account_ids=account_ids)
     return AccountsResponse(accounts=accounts)
 
 
