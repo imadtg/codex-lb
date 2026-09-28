@@ -64,12 +64,6 @@ jobs:
           bun-version: "1.3.14"
           no-cache: true
 
-      - name: Install frontend dependencies
-        run: cd frontend && bun install --frozen-lockfile
-
-      - name: Build frontend assets
-        run: cd frontend && bun run build
-
       - name: Set up uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
         with:

@@ -139,3 +139,5 @@ artifacts = ["app/static/**"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app","config"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]

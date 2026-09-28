@@ -2,7 +2,9 @@
 
 ## Purpose
 Governs the GitHub workflow that keeps the beta release PR in sync with the release-please train. When the train moves before a beta PR merges, older automation-created beta PRs must be closed and their branches removed so a stale PR cannot be merged, while manual, protected, and current beta PRs are preserved and newly created beta PRs carry a changelog consistent with the stable release PR.
+
 ## Requirements
+
 ### Requirement: Superseded beta release PR cleanup
 
 The beta release sync workflow SHALL close open automation-managed beta release PRs that no longer match the current beta release branch.
@@ -61,3 +63,22 @@ The beta release sync workflow SHALL include a generated changelog section in th
 - **THEN** the PR body includes a `Changes since v1.20.0-beta.2` section
 - **AND** the section lists the releasable Conventional Commit subjects included in that beta PR
 
+### Requirement: Python wheel builds include the dashboard
+
+Every Python wheel build SHALL compile the locked frontend and package the
+resulting dashboard with the backend.
+
+#### Scenario: A wheel is built outside the release workflow
+
+- **GIVEN** a clean source checkout with Bun available
+- **WHEN** a PEP 517 frontend builds the codex-lb wheel
+- **THEN** the build installs the frontend dependencies from the lockfile
+- **AND** compiles the frontend
+- **AND** the wheel contains `app/static/index.html`
+- **AND** the wheel contains generated JavaScript and CSS assets
+
+#### Scenario: Frontend compilation is incomplete
+
+- **GIVEN** the frontend build does not produce its HTML entry point, JavaScript, or CSS
+- **WHEN** the wheel build validates the generated assets
+- **THEN** the wheel build fails instead of publishing a backend-only package
