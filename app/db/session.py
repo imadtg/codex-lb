@@ -5,7 +5,9 @@ import inspect
 import logging
 import os
 import sqlite3
+import threading
 import time
+import weakref
 from contextlib import asynccontextmanager
 from enum import StrEnum
 from pathlib import Path
@@ -69,6 +71,13 @@ _SQLITE_WRITE_STATEMENT_PREFIXES = (
     "begin exclusive",
 )
 _SQLITE_WATCHDOG_STATEMENT_PREVIEW_CHARS = 300
+# A post-commit warning cannot identify a writer whose transaction never
+# ends.  Keep weak references to successful writers so a competing SQLITE_BUSY
+# can report the *possible* holders while the contention is still happening.
+_SQLITE_BUSY_DIAGNOSTIC_INTERVAL_SECONDS = 30.0
+_SQLITE_BUSY_DIAGNOSTIC_MAX_CANDIDATES = 4
+_sqlite_live_writers_lock = threading.Lock()
+_sqlite_live_writers: weakref.WeakKeyDictionary[Connection, str] = weakref.WeakKeyDictionary()
 # Initial observation bound for file-backed SQLite teardown. A pending worker
 # can retain the single writer slot (issue #1682); after the completion grace,
 # reclamation attempts to interrupt the driver and invalidate its connection.
@@ -229,8 +238,12 @@ def _install_sqlite_long_write_watchdog(engine: Engine) -> None:
     statement, not at BEGIN, so the window is measured from the first write to
     commit/rollback. The report fires when the holder finally ends — the stall
     in issue #1682 self-recovers, so identifying the holder post-hoc is the
-    point; a live sampler is not needed to attribute it.
+    point. Busy-error diagnostics additionally identify still-open candidate
+    holders when this post-transaction report cannot fire.
     """
+
+    database_identity = str(Path(engine.url.database).resolve()) if engine.url.database else f"engine:{id(engine)}"
+    last_busy_diagnostic_at = 0.0
 
     def _live_connection_info(conn: object) -> dict[str, object] | None:
         # Connection.info may reconnect an invalidated driver connection. A
@@ -239,6 +252,104 @@ def _install_sqlite_long_write_watchdog(engine: Engine) -> None:
         if getattr(conn, "invalidated", False) or getattr(conn, "closed", False):
             return None
         return getattr(conn, "info", None)
+
+    def _task_stack_summary(info: dict[str, object]) -> str:
+        task_ref = info.get("sqlite_write_task_ref")
+        task = task_ref() if isinstance(task_ref, weakref.ReferenceType) else None
+        if task is None:
+            return "unknown"
+        try:
+            frames = [
+                f"{Path(frame.f_code.co_filename).name}:{frame.f_lineno}:{frame.f_code.co_name}"
+                for frame in task.get_stack(limit=16)
+                if "/app/" in frame.f_code.co_filename
+            ]
+        except Exception:
+            return "unknown"
+        return " > ".join(frames[-4:]) if frames else "unknown"
+
+    def _sql_operation(statement: object) -> str:
+        # SQL text can contain literals even without bound parameters.
+        # Report only a fixed operation vocabulary, never the statement itself.
+        if not isinstance(statement, str) or not statement.strip():
+            return "unknown"
+        operation = statement.split(maxsplit=1)[0].lower()
+        return (
+            operation
+            if operation in {"insert", "update", "delete", "replace", "create", "drop", "alter", "vacuum", "begin"}
+            else "unknown"
+        )
+
+    def _busy_candidates(victim: object) -> tuple[int, list[str]]:
+        with _sqlite_live_writers_lock:
+            connections = [
+                conn
+                for conn, identity in _sqlite_live_writers.items()
+                if identity == database_identity and conn is not victim
+            ]
+        candidates: list[tuple[float, str]] = []
+        now = time.monotonic()
+        for conn in connections:
+            info = _live_connection_info(conn)
+            if info is None:
+                continue
+            started_at = info.get("sqlite_write_started_at")
+            phase = "write_open"
+            first = info.get("sqlite_first_write_statement")
+            last = info.get("sqlite_last_write_statement")
+            task_name = info.get("sqlite_write_task")
+            if not isinstance(started_at, float):
+                pending = info.get("sqlite_write_pending_report")
+                if not isinstance(pending, tuple) or len(pending) != 5:
+                    continue
+                started_at, phase, first, last, task_name = pending
+                phase = f"ending_{phase}"
+            if not isinstance(started_at, float):
+                continue
+            age = max(0.0, now - started_at)
+            candidates.append(
+                (
+                    age,
+                    (
+                        f"age_seconds={age:.1f} phase={phase} task={task_name!r} "
+                        f"stack={_task_stack_summary(info)!r} first_operation={_sql_operation(first)} "
+                        f"last_operation={_sql_operation(last)}"
+                    ),
+                )
+            )
+        candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+        return len(candidates), [item for _, item in candidates[:_SQLITE_BUSY_DIAGNOSTIC_MAX_CANDIDATES]]
+
+    @event.listens_for(engine, "handle_error")
+    def _report_live_writers_on_busy(exception_context: object) -> None:
+        nonlocal last_busy_diagnostic_at
+        try:
+            original = getattr(exception_context, "original_exception", None)
+            if not isinstance(original, sqlite3.OperationalError):
+                return
+            error_code = getattr(original, "sqlite_errorcode", None)
+            if error_code is not None:
+                if error_code & 0xFF not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    return
+            elif "database is locked" not in str(original).lower():
+                return
+            now = time.monotonic()
+            if now - last_busy_diagnostic_at < _SQLITE_BUSY_DIAGNOSTIC_INTERVAL_SECONDS:
+                return
+            last_busy_diagnostic_at = now
+            victim = getattr(exception_context, "connection", None)
+            total, candidates = _busy_candidates(victim)
+            logger.warning(
+                "sqlite_busy_live_writers candidate_count=%d shown=%d omitted=%d candidates=%s; "
+                "candidates are same-process successful writes, not proven lock owners",
+                total,
+                len(candidates),
+                max(0, total - len(candidates)),
+                candidates,
+            )
+        except Exception:
+            # Diagnostic hooks must never change the outcome of the failed SQL.
+            logger.debug("Could not inspect live SQLite writers", exc_info=True)
 
     @event.listens_for(engine, "after_cursor_execute")
     def _track_write_statements(
@@ -265,10 +376,19 @@ def _install_sqlite_long_write_watchdog(engine: Engine) -> None:
             info["sqlite_write_started_at"] = time.monotonic()
             info["sqlite_first_write_statement"] = preview
             info["sqlite_write_task"] = _current_task_name_best_effort()
+            try:
+                task = asyncio.current_task()
+                if task is not None:
+                    info["sqlite_write_task_ref"] = weakref.ref(task)
+            except RuntimeError:
+                pass
+            with _sqlite_live_writers_lock:
+                _sqlite_live_writers[conn] = database_identity
         info["sqlite_last_write_statement"] = preview
 
     def _finalize_pending_report(info: dict[str, object]) -> None:
         pending = info.pop("sqlite_write_pending_report", None)
+        info.pop("sqlite_write_task_ref", None)
         if not isinstance(pending, tuple):
             return
         started_at, outcome, first_statement, last_statement, task_name = pending

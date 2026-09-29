@@ -53,7 +53,7 @@ from app.core.openai.requests import (
     ResponsesRequest,
 )
 from app.core.types import JsonObject, JsonValue
-from app.core.utils.request_id import ensure_request_id, ensure_request_scope_id
+from app.core.utils.request_id import ensure_request_id, ensure_request_scope_id, get_request_id, get_request_scope_id
 from app.core.utils.sse import format_sse_event, parse_sse_data_json, sse_block_with_payload
 from app.core.utils.time import utcnow
 from app.db.models import (
@@ -186,6 +186,7 @@ from app.modules.proxy._service.observability import (
 from app.modules.proxy._service.observability import (
     record_http_bridge_routing,
 )
+from app.modules.proxy._service.response_create import _stored_context_prefix_fingerprints
 from app.modules.proxy._service.support import (
     _ACCOUNT_SELECTION_RECOVERY_HEARTBEAT_SECONDS,
     _HARD_HTTP_BRIDGE_AFFINITY_KINDS,  # noqa: F401
@@ -334,6 +335,22 @@ def _durable_full_resend_anchor_rejection(
         stored_count=stored_count,
         stored_fingerprint=lookup.latest_input_full_fingerprint,
     ):
+        raw_prefix, normalized_prefix = _stored_context_prefix_fingerprints(payload.input, stored_count=stored_count)
+        logger.warning(
+            "http_bridge_prefix_proof_mismatch request=%s scope=%s input_count=%s stored_count=%s "
+            "stored_prefix_sha256=%s incoming_prefix_sha256=%s normalized_prefix_sha256=%s "
+            "input_longer_than_stored=%s client_anchored=%s pending_manifest_present=%s",
+            _hash_identifier_or_none(get_request_id()),
+            _hash_identifier_or_none(get_request_scope_id()),
+            len(payload.input) if isinstance(payload.input, list) else None,
+            stored_count,
+            lookup.latest_input_full_fingerprint[:12] if lookup.latest_input_full_fingerprint else None,
+            raw_prefix,
+            normalized_prefix,
+            isinstance(payload.input, list) and len(payload.input) > stored_count,
+            payload.previous_response_id is not None,
+            lookup.latest_pending_tool_calls is not None,
+        )
         return "prefix_fingerprint_mismatch"
     if not isinstance(payload.input, list):
         return "input_not_itemized"

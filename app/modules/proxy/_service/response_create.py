@@ -159,6 +159,21 @@ def _fingerprint_input_items(items: Sequence[JsonValue]) -> str:
     return sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _stored_context_prefix_fingerprints(input_value: JsonValue, *, stored_count: int) -> tuple[str | None, str | None]:
+    """Bounded identifiers for raw and forwarding-normalized prefix diagnostics.
+
+    No payload content, ciphertext, item IDs or arbitrary type strings leave
+    this helper. Diagnostic hashes use the same canonicalization as the proof.
+    """
+    if stored_count <= 0 or not isinstance(input_value, list):
+        return None, None
+    prefix = cast(list[JsonValue], input_value)[:stored_count]
+    raw = _fingerprint_input_items(prefix)[:12]
+    normalized: dict[str, JsonValue] = {"input": prefix}
+    strip_replayed_tool_call_namespaces_from_payload(normalized)
+    return raw, _fingerprint_input_items(normalized["input"])[:12]
+
+
 def _input_prefix_matches_stored_context(
     input_value: JsonValue,
     *,

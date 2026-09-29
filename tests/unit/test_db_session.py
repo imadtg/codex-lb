@@ -1080,6 +1080,73 @@ async def test_sqlite_long_write_watchdog_does_not_blame_a_victim_waiting_for_th
 
 
 @pytest.mark.asyncio
+async def test_sqlite_busy_reports_a_live_writer_before_its_transaction_ends(tmp_path, caplog, monkeypatch) -> None:
+    """The holder can remain open indefinitely, so the victim's busy error
+    must identify the in-process candidate without waiting for a commit.
+    Both engines point at the same file, as the request and background engines
+    do in production; a second failed attempt must not flood the journal.
+    """
+    db_path = tmp_path / "busy-candidate.db"
+    holder_engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db_path}", poolclass=NullPool, connect_args={"timeout": 5.0}
+    )
+    victim_engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db_path}", poolclass=NullPool, connect_args={"timeout": 0.1}
+    )
+    session_module._install_sqlite_long_write_watchdog(holder_engine.sync_engine)
+    session_module._install_sqlite_long_write_watchdog(victim_engine.sync_engine)
+    try:
+        async with holder_engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        caplog.clear()
+
+        holder_factory = async_sessionmaker(holder_engine, expire_on_commit=False)
+        victim_factory = async_sessionmaker(victim_engine, expire_on_commit=False)
+        with caplog.at_level(logging.WARNING, logger=session_module.__name__):
+            async with holder_factory() as holder_session:
+                await holder_session.execute(sa_text("DELETE FROM accounts WHERE email = 'private-literal-never-log'"))
+                for _ in range(2):
+                    async with victim_factory() as victim_session:
+                        with pytest.raises(Exception, match="database is locked"):
+                            await victim_session.execute(sa_text("DELETE FROM accounts"))
+                        await victim_session.rollback()
+                # The diagnostic must already have fired while this writer
+                # still owns the SQLite slot.
+                reports = [
+                    record.getMessage()
+                    for record in caplog.records
+                    if "sqlite_busy_live_writers" in record.getMessage()
+                ]
+                assert len(reports) == 1
+                assert "candidate_count=1" in reports[0]
+                assert "phase=write_open" in reports[0]
+                assert "first_operation=delete" in reports[0]
+                assert "DELETE FROM accounts" not in reports[0]
+                assert "private-literal-never-log" not in reports[0]
+                await holder_session.rollback()
+            # A later lock from an uninstrumented connection must not report
+            # the completed holder as active. This also exercises the explicit
+            # no-observed-holder case without inventing connection internals.
+            monkeypatch.setattr(session_module, "_SQLITE_BUSY_DIAGNOSTIC_INTERVAL_SECONDS", 0.0)
+            untracked_engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", poolclass=NullPool)
+            try:
+                async with untracked_engine.begin() as untracked:
+                    await untracked.execute(sa_text("DELETE FROM accounts"))
+                    caplog.clear()
+                    async with victim_factory() as victim_session:
+                        with pytest.raises(Exception, match="database is locked"):
+                            await victim_session.execute(sa_text("DELETE FROM accounts"))
+                        await victim_session.rollback()
+                    assert "candidate_count=0" in caplog.text
+                    assert "first_operation=delete" not in caplog.text
+            finally:
+                await untracked_engine.dispose()
+    finally:
+        await victim_engine.dispose()
+        await holder_engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_sqlite_long_write_watchdog_includes_a_slow_transaction_end_in_the_hold(
     tmp_path, monkeypatch, caplog
 ) -> None:

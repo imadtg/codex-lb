@@ -12,7 +12,7 @@ from app.modules.proxy import service as proxy_service
 from app.modules.proxy._service import observability as observability_module
 from app.modules.proxy._service.http_bridge import helpers as http_bridge_helpers
 from app.modules.proxy._service.http_bridge import streaming as http_bridge_streaming_module
-from app.modules.proxy._service.response_create import _fingerprint_input_items
+from app.modules.proxy._service.response_create import _fingerprint_input_items, _stored_context_prefix_fingerprints
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup
 
 pytestmark = pytest.mark.unit
@@ -249,3 +249,38 @@ def test_lookup_field_rename_fails_here() -> None:
     # fail here rather than silently degrade every refusal to one reason.
     lookup = replace(_matching_lookup(), latest_input_item_count=None)
     assert _anchor_rejection(_full_resend_payload(), lookup) == "anchor_metadata_missing"
+
+
+def test_prefix_mismatch_logs_only_bounded_proof_facts(caplog: pytest.LogCaptureFixture) -> None:
+    secret = "private-context-never-log"
+    items: list[JsonValue] = [{"type": "message", "role": "user", "content": secret}, _FRESH_ITEM]
+    with caplog.at_level(logging.WARNING):
+        assert _anchor_rejection(_payload(items), _matching_lookup()) == "prefix_fingerprint_mismatch"
+    assert secret not in caplog.text
+    assert "input_count=2 stored_count=2" in caplog.text
+    assert "input_longer_than_stored=False" in caplog.text
+    assert f"stored_prefix_sha256={_fingerprint_input_items(_STORED_ITEMS)[:12]}" in caplog.text
+    assert f"incoming_prefix_sha256={_fingerprint_input_items(items)[:12]}" in caplog.text
+    assert "client_anchored=False" in caplog.text
+
+
+def test_prefix_diagnostic_matches_proof_normalization_without_mutating_input() -> None:
+    call: JsonValue = {
+        "type": "function_call",
+        "name": "run",
+        "call_id": "call-private",
+        "namespace": "functions",
+        "arguments": "{}",
+    }
+    items: list[JsonValue] = [call, _FRESH_ITEM]
+    stripped: JsonValue = {"type": "function_call", "name": "run", "call_id": "call-private", "arguments": "{}"}
+    assert _stored_context_prefix_fingerprints(items, stored_count=1) == (
+        _fingerprint_input_items([call])[:12],
+        _fingerprint_input_items([stripped])[:12],
+    )
+    assert isinstance(call, dict) and call["namespace"] == "functions"
+
+
+@pytest.mark.parametrize("input_value,stored_count", [("text", 2), ([], 0), ([], -1)])
+def test_prefix_diagnostic_handles_nonpositive_or_unitemized_context(input_value: JsonValue, stored_count: int) -> None:
+    assert _stored_context_prefix_fingerprints(input_value, stored_count=stored_count) == (None, None)
