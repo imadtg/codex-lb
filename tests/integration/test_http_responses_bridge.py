@@ -43,6 +43,7 @@ from app.db.models import (
     HttpBridgeSessionState,
     RequestLog,
     StickySession,
+    StickySessionKind,
 )
 from app.db.session import SessionLocal
 from app.dependencies import get_proxy_service_for_app
@@ -65,7 +66,7 @@ from app.modules.proxy.load_balancer import (
     CatalogOmissionQuotaAdmission,
 )
 from app.modules.proxy.sticky_repository import StickySessionsRepository
-from app.modules.usage.repository import AdditionalUsageRepository
+from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 
 pytestmark = pytest.mark.integration
 _TEST_SYNC_TIMEOUT_SECONDS = 5.0
@@ -6456,6 +6457,97 @@ async def test_backend_responses_http_bridge_prefers_codex_session_header_over_p
     )
     assert len(fake_upstream.sent_text) == 2
     assert json.loads(fake_upstream.sent_text[1])["prompt_cache_key"] == "backend-http-prompt-b"
+
+
+@pytest.mark.asyncio
+async def test_backend_bridge_new_thread_avoids_exhausted_process_preference(
+    async_client,
+    monkeypatch,
+):
+    """The external HTTP path starts a new thread on usable quota."""
+    _install_bridge_settings(monkeypatch, enabled=True)
+    exhausted_id = await _import_account(
+        async_client, "acc_bridge_process_exhausted", "bridge-process-exhausted@example.com"
+    )
+    available_id = await _import_account(
+        async_client, "acc_bridge_process_available", "bridge-process-available@example.com"
+    )
+    process_key = _codex_session_selection_key("process-exhausted-new-thread")
+    async with SessionLocal() as session:
+        await StickySessionsRepository(session).upsert(process_key, exhausted_id, kind=StickySessionKind.CODEX_SESSION)
+    paused = await async_client.post(f"/api/accounts/{exhausted_id}/pause")
+    assert paused.status_code == 200
+    reactivated = await async_client.post(f"/api/accounts/{exhausted_id}/reactivate")
+    assert reactivated.status_code == 200
+
+    now = utcnow()
+    reset_at = int(now.replace(tzinfo=timezone.utc).timestamp()) + 3600
+    async with SessionLocal() as session:
+        usage = UsageRepository(session)
+        for account_id, weekly_used in ((exhausted_id, 100.0), (available_id, 10.0)):
+            await usage.add_entry(
+                account_id=account_id,
+                used_percent=0.0,
+                window="primary",
+                reset_at=reset_at,
+                window_minutes=300,
+                recorded_at=now,
+                credits_has=False,
+                credits_unlimited=False,
+                credits_balance=0.0,
+            )
+            await usage.add_entry(
+                account_id=account_id,
+                used_percent=weekly_used,
+                window="secondary",
+                reset_at=reset_at,
+                window_minutes=10080,
+                recorded_at=now,
+            )
+
+    async with SessionLocal() as session:
+        latest = await UsageRepository(session).latest_entry_for_account(exhausted_id, window="secondary")
+        assert latest is not None
+        assert latest.used_percent == 100.0
+
+    upstream = _FakeBridgeUpstreamWebSocket()
+    connected_accounts: list[str | None] = []
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers, access_token, account_id_header, *, base_url=None, session=None
+    ):
+        del headers, access_token, base_url, session
+        connected_accounts.append(account_id_header)
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+    events = await _collect_sse_events(
+        async_client,
+        "/backend-api/codex/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "hello",
+            "stream": True,
+        },
+        headers={
+            "x-codex-session-id": "process-exhausted-new-thread",
+            "thread-id": "thread-after-weekly-exhaustion",
+        },
+    )
+    _assert_created_text_delta_completed(events)
+    assert connected_accounts == [(await _get_account(available_id)).chatgpt_account_id]
+    async with SessionLocal() as session:
+        process_owner = await StickySessionsRepository(session).get_entry(
+            process_key, kind=StickySessionKind.CODEX_SESSION
+        )
+        assert process_owner is not None
+        assert process_owner.account_id == exhausted_id
 
 
 @pytest.mark.asyncio

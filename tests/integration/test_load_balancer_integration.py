@@ -9,7 +9,7 @@ import pytest
 from app.core.balancer import HEALTH_TIER_DRAINING
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus
+from app.db.models import Account, AccountStatus, StickySessionKind
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
@@ -34,6 +34,101 @@ async def _repo_factory() -> AsyncIterator[ProxyRepositories]:
             api_keys=ApiKeysRepository(session),
             additional_usage=AdditionalUsageRepository(session),
         )
+
+
+@pytest.mark.asyncio
+async def test_new_thread_bypasses_exhausted_process_preference_after_dashboard_reactivation(async_client, db_setup):
+    """A manual reactivation must not keep a soft cache pin at 100% weekly usage."""
+    encryptor = TokenEncryptor()
+    now = utcnow()
+    reset_at = int(now.replace(tzinfo=timezone.utc).timestamp()) + 3600
+    exhausted = Account(
+        id="acc_reactivated_exhausted_soft_affinity",
+        email="reactivated-exhausted@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access-exhausted"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-exhausted"),
+        id_token_encrypted=encryptor.encrypt("id-exhausted"),
+        last_refresh=now,
+        status=AccountStatus.QUOTA_EXCEEDED,
+        reset_at=reset_at,
+    )
+    available = Account(
+        id="acc_reactivated_available_soft_affinity",
+        email="reactivated-available@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access-available"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-available"),
+        id_token_encrypted=encryptor.encrypt("id-available"),
+        last_refresh=now,
+        status=AccountStatus.ACTIVE,
+    )
+    sticky_key = "new-thread-soft-prompt-cache"
+    seed_key = "existing-process-preference"
+    async with SessionLocal() as session:
+        accounts = AccountsRepository(session)
+        usage = UsageRepository(session)
+        await accounts.upsert(exhausted)
+        await accounts.upsert(available)
+        for account, weekly_used in ((exhausted, 100.0), (available, 96.0)):
+            await usage.add_entry(
+                account_id=account.id,
+                used_percent=0.0,
+                window="primary",
+                reset_at=reset_at,
+                window_minutes=300,
+                recorded_at=now,
+                credits_has=False,
+                credits_unlimited=False,
+                credits_balance=0.0,
+            )
+            await usage.add_entry(
+                account_id=account.id,
+                used_percent=weekly_used,
+                window="secondary",
+                reset_at=reset_at,
+                window_minutes=10080,
+                recorded_at=now,
+            )
+        await StickySessionsRepository(session).upsert(seed_key, exhausted.id, kind=StickySessionKind.CODEX_SESSION)
+
+    reactivated = await async_client.post(f"/api/accounts/{exhausted.id}/reactivate")
+    assert reactivated.status_code == 200
+
+    selection = await LoadBalancer(_repo_factory).select_account(
+        sticky_key=sticky_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        sticky_seed_key=seed_key,
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        routing_strategy="capacity_weighted",
+        secondary_budget_threshold_pct=95.0,
+    )
+    assert selection.account is not None
+    assert selection.account.id == available.id
+    async with SessionLocal() as session:
+        affinity = await StickySessionsRepository(session).get_entry(sticky_key, kind=StickySessionKind.PROMPT_CACHE)
+        assert affinity is not None
+        assert affinity.account_id == available.id
+        process_preference = await StickySessionsRepository(session).get_entry(
+            seed_key, kind=StickySessionKind.CODEX_SESSION
+        )
+        assert process_preference is not None
+        assert process_preference.account_id == exhausted.id
+
+    # Local usage remains advisory when there is no usable sibling.
+    only_account = await LoadBalancer(_repo_factory).select_account(
+        sticky_key="new-thread-no-alternative",
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        sticky_seed_key=seed_key,
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        account_ids={exhausted.id},
+        routing_strategy="capacity_weighted",
+        secondary_budget_threshold_pct=95.0,
+    )
+    assert only_account.account is not None
+    assert only_account.account.id == exhausted.id
 
 
 @pytest.mark.asyncio

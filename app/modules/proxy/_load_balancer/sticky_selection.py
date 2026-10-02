@@ -1464,10 +1464,10 @@ async def _select_with_stickiness(
     # reassignment.
     persist_fallback = not preserve_existing_mapping_on_fallback
     apply_sticky_secondary_budget_threshold = False
-    # Set when an isolated soft owner is released: the replacement pick and the
-    # overload-free pool it came from (probe reservation must see that pool).
-    overload_reroute: SelectionResult | None = None
-    overload_reroute_pool: list[AccountState] | None = None
+    # A first-thread process preference or an isolated soft owner may be
+    # bypassed; carry the chosen replacement and its admission pool together.
+    preferred_reroute: SelectionResult | None = None
+    preferred_reroute_pool: list[AccountState] | None = None
 
     def _choose_from(candidates: list[AccountState]) -> SelectionResult:
         return _select_account_preferring_budget_safe(
@@ -1509,9 +1509,43 @@ async def _select_with_stickiness(
             if preference_free_pool is not states:
                 alternative = _choose_from(preference_free_pool)
                 if alternative.account is not None and alternative.account.account_id != initial_preferred.account_id:
-                    overload_reroute = alternative
-                    overload_reroute_pool = preference_free_pool
-        if initial_preferred is not None and overload_reroute is None:
+                    preferred_reroute = alternative
+                    preferred_reroute_pool = preference_free_pool
+        if (
+            initial_preferred is not None
+            and preferred_reroute is None
+            and sticky_kind == StickySessionKind.PROMPT_CACHE
+            and (
+                (initial_preferred.used_percent is not None and initial_preferred.used_percent >= 100.0)
+                or (
+                    initial_preferred.secondary_used_percent is not None
+                    and initial_preferred.secondary_used_percent >= 100.0
+                )
+            )
+        ):
+            # A process seed is only a preference for a thread with no owner
+            # yet. At full observed usage, admit that new thread on a sibling
+            # with actual remaining quota instead of making its first upstream
+            # response (and hence its continuity) depend on the exhausted
+            # process account. Keep the process seed unchanged.
+            alternatives = [
+                state
+                for state in states
+                if state.account_id != initial_preferred.account_id
+                and (state.used_percent is None or state.used_percent < 100.0)
+                and (state.secondary_used_percent is None or state.secondary_used_percent < 100.0)
+                and (state.used_percent is not None or state.secondary_used_percent is not None)
+            ]
+            if alternatives:
+                if overload_backoff_runtime is not None:
+                    alternatives = filter_overload_backoff_candidates(
+                        alternatives, overload_backoff_runtime, now=clock.time()
+                    )
+                alternative = _choose_from(alternatives)
+                if alternative.account is not None:
+                    preferred_reroute = alternative
+                    preferred_reroute_pool = alternatives
+        if initial_preferred is not None and preferred_reroute is None:
             initial_result = select_account(
                 [initial_preferred],
                 prefer_earlier_reset=prefer_earlier_reset_accounts,
@@ -1603,22 +1637,22 @@ async def _select_with_stickiness(
                 StickySessionKind.STICKY_THREAD,
                 StickySessionKind.CODEX_SESSION,
             ):
-                overload_reroute_pool = sticky_owner_isolation_reroute_pool(
+                preferred_reroute_pool = sticky_owner_isolation_reroute_pool(
                     states,
                     overload_backoff_runtime,
                     owner_account_id=pinned.account_id,
                     now=now,
                 )
-            if overload_reroute_pool is not None:
+            if preferred_reroute_pool is not None:
                 # A budget-pressured owner's replacement honors the same
                 # secondary-budget filter the budget reallocation applies, so
                 # the rebind does not land on an equally pressured sibling
                 # that the next turn would reallocate again.
                 if budget_pressured:
                     apply_sticky_secondary_budget_threshold = True
-                candidate = _choose_from(overload_reroute_pool)
+                candidate = _choose_from(preferred_reroute_pool)
                 if candidate.account is not None and candidate.account.account_id != pinned.account_id:
-                    overload_reroute = candidate
+                    preferred_reroute = candidate
                     # Account identifiers are deliberately omitted: this path
                     # has no privacy flag and private realtime diagnostics
                     # must not expose them. The isolation-engaged warning
@@ -1626,12 +1660,12 @@ async def _select_with_stickiness(
                     logger.info(
                         "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d",
                         sticky_kind.value,
-                        len(overload_reroute_pool),
+                        len(preferred_reroute_pool),
                     )
                 else:
-                    overload_reroute_pool = None
+                    preferred_reroute_pool = None
 
-            if overload_reroute is not None:
+            if preferred_reroute is not None:
                 reallocate_sticky = True
             elif not ((budget_pressured or rate_limit_far_away) and burn_first_reallocate):
                 pinned_result = select_account(
@@ -1762,9 +1796,9 @@ async def _select_with_stickiness(
     # above never consult the overload window, so an established owner keeps
     # serving its session even while backed off.
     fallback_candidates = states
-    if overload_reroute is not None and overload_reroute_pool is not None:
-        fallback_candidates = overload_reroute_pool
-        chosen = overload_reroute
+    if preferred_reroute is not None and preferred_reroute_pool is not None:
+        fallback_candidates = preferred_reroute_pool
+        chosen = preferred_reroute
     else:
         if overload_backoff_runtime is not None:
             fallback_candidates = filter_overload_backoff_candidates(states, overload_backoff_runtime, now=clock.time())
