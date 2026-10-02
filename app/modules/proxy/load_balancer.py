@@ -101,6 +101,7 @@ from app.modules.proxy._load_balancer.opportunistic_admission import (
     run_opportunistic_admission,
 )
 from app.modules.proxy._load_balancer.quarantine import apply_local_routing_quarantine
+from app.modules.proxy._load_balancer.selection_diagnostics import account_label, account_snapshots
 from app.modules.proxy._load_balancer.sticky_selection import (
     _STICKY_EXISTING_UNSET,
     SelectionInputsProtocol,
@@ -1000,6 +1001,70 @@ class LoadBalancer:
                 )
 
         if selected_snapshot is None:
+            catalog_lookup = getattr(get_model_registry(), "account_ids_for_model", None)
+            catalog_accounts = catalog_lookup(model) if model and callable(catalog_lookup) else None
+            candidate_ids = {account.id for account in selection_inputs.accounts}
+            usage_samples = []
+            for account in (selection_inputs.runtime_accounts or selection_inputs.accounts)[:16]:
+                windows = {}
+                for window, rows in (
+                    ("primary", selection_inputs.latest_primary),
+                    ("secondary", selection_inputs.latest_secondary),
+                    ("monthly", selection_inputs.latest_monthly),
+                ):
+                    sample = rows.get(account.id)
+                    if sample is not None:
+                        windows[window] = {
+                            "used_percent": sample.used_percent,
+                            "recorded_at": sample.recorded_at.isoformat(),
+                            "reset_at": sample.reset_at,
+                        }
+                runtime = self._runtime.get(account.id)
+                usage_samples.append(
+                    {
+                        "account": account_label(account.id),
+                        "windows": windows,
+                        "runtime": (
+                            {
+                                "reset_at": runtime.reset_at,
+                                "blocked_at": runtime.blocked_at,
+                                "cooldown_until": runtime.cooldown_until,
+                                "error_count": runtime.error_count,
+                                "last_error_at": runtime.last_error_at,
+                                "overload_backoff_until": runtime.overload_backoff_until,
+                                "burst_backoff_until": runtime.burst_backoff_until,
+                            }
+                            if runtime is not None
+                            else None
+                        ),
+                    }
+                )
+            logger.warning(
+                "account_selection_failure_evidence %s",
+                json.dumps(
+                    {
+                        "model": model,
+                        "service_tier": service_tier,
+                        "error_code": selection_error_code,
+                        "routing_strategy": routing_strategy,
+                        "sticky_kind": sticky_kind.value if sticky_kind is not None else None,
+                        "candidate_count": len(selection_inputs.accounts),
+                        "all_account_count": len(selection_inputs.runtime_accounts or selection_inputs.accounts),
+                        "accounts_truncated": len(selection_inputs.runtime_accounts or selection_inputs.accounts) > 16,
+                        "accounts": account_snapshots(
+                            selection_inputs.runtime_accounts or selection_inputs.accounts, candidate_ids
+                        ),
+                        "usage": usage_samples,
+                        "catalog_support": (
+                            sorted(account_label(account_id) for account_id in catalog_accounts)
+                            if catalog_accounts is not None
+                            else None
+                        ),
+                        "excluded_accounts": sorted(account_label(account_id) for account_id in excluded_ids),
+                    },
+                    sort_keys=True,
+                ),
+            )
             logger.warning(
                 "No account selected strategy=%s sticky=%s model=%s error=%s",
                 routing_strategy,

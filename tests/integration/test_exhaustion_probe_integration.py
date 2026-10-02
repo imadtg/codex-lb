@@ -11,6 +11,7 @@ account state untouched.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -24,11 +25,12 @@ from app.core.balancer import USAGE_LIMIT_REACHED
 from app.core.config.settings_cache import get_settings_cache
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus, StickySession
+from app.db.models import Account, AccountStatus, StickySession, StickySessionKind
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.proxy._load_balancer.exhaustion_probe import PoolExhaustion, probe_pool_usage_exhaustion
+from app.modules.proxy._load_balancer.selection_diagnostics import account_label
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.proxy.load_balancer import AccountSelection
 from app.modules.proxy.repo_bundle import ProxyRepositories
@@ -259,6 +261,56 @@ async def test_probe_reports_a_healthy_pool_as_not_exhausted_and_acquires_no_lea
     assert leased.account is not None and leased.lease is not None
     assert balancer._runtime[leased.account.id].inflight_streams == 1
     await balancer.release_account_lease(leased.lease)
+
+
+@pytest.mark.asyncio
+async def test_failed_sticky_selection_records_the_candidates_and_available_account_recovers(db_setup, caplog) -> None:
+    now = int(time.time())
+    await _seed(
+        [
+            (_exhausted("exhausted", now_epoch=now, reset_at=now + 3600), 100.0, 100.0),
+            (_exhausted("available", now_epoch=now, reset_at=now + 3600), 100.0, 100.0),
+        ],
+        primary_reset_at=now + 3600,
+        secondary_reset_at=now + 6 * 86400,
+    )
+    service = ProxyService(_repo_factory)
+    with caplog.at_level("WARNING", logger="app.modules.proxy.load_balancer"):
+        failed = await service._load_balancer.select_account(
+            sticky_key="test-thread", sticky_kind=StickySessionKind.PROMPT_CACHE, model=_MODEL
+        )
+    assert failed.error_code == USAGE_LIMIT_REACHED
+    stage = next(
+        json.loads(record.message.split(" ", 1)[1])
+        for record in caplog.records
+        if record.message.startswith("account_selection_failure_stages ")
+    )
+    evidence = next(
+        json.loads(record.message.split(" ", 1)[1])
+        for record in caplog.records
+        if record.message.startswith("account_selection_failure_evidence ")
+    )
+    assert {row["account"] for row in stage["prepared_states"]} == {
+        account_label("exhausted"),
+        account_label("available"),
+    }
+    assert len(stage["cap_filtered_states"]) == 2
+    assert evidence["candidate_count"] == 2
+    assert {row["account"] for row in evidence["usage"]} == {account_label("exhausted"), account_label("available")}
+    assert "@example.com" not in caplog.text
+
+    # A real status and usage refresh, not an internal runtime mutation, makes
+    # one account routable; the selector must then serve that account.
+    await _seed(
+        [(_account("available"), 0.0, 86.0)],
+        primary_reset_at=now + 3600,
+        secondary_reset_at=now + 6 * 86400,
+    )
+    recovered = await service._load_balancer.select_account(
+        sticky_key="test-thread", sticky_kind=StickySessionKind.PROMPT_CACHE, model=_MODEL
+    )
+    assert recovered.account is not None
+    assert recovered.account.id == "available"
 
 
 @pytest.mark.asyncio

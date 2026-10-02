@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -24,6 +25,7 @@ from app.core.balancer import (
 )
 from app.core.clock import Clock
 from app.core.crypto import TokenEncryptor
+from app.core.utils.request_id import get_request_id
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, AdditionalUsageHistory, StickySessionKind, UsageHistory
 from app.db.snapshot import clone_row
@@ -34,6 +36,7 @@ from app.modules.proxy._load_balancer.overload_backoff import (
     overload_isolation_active,
     sticky_owner_isolation_reroute_pool,
 )
+from app.modules.proxy._load_balancer.selection_diagnostics import account_label, state_snapshots
 from app.modules.proxy._load_balancer.tunables import RoutingTunables
 from app.modules.proxy._load_balancer.types import (
     MAX_SELECTION_ATTEMPTS,
@@ -1338,6 +1341,28 @@ async def run_sticky_selection_path(
                     raise
         break
 
+    if selected_snapshot is None:
+        logger.warning(
+            "account_selection_failure_stages %s",
+            json.dumps(
+                {
+                    "request_id": get_request_id(),
+                    "error_code": selection_error_code,
+                    "sticky_kind": sticky_kind.value if sticky_kind is not None else None,
+                    "sticky_source": sticky_source,
+                    "sticky_owner": account_label(sticky_existing_account_id),
+                    "legacy_owner": account_label(legacy_existing_account_id),
+                    "abandoned_legacy_owner": account_label(legacy_abandoned_account_id),
+                    "retired_legacy_owners": sorted(
+                        account_label(account_id) for account_id in retired_legacy_owner_account_ids
+                    ),
+                    "prepared_states": state_snapshots(states),
+                    "cap_filtered_states": state_snapshots(selection_states),
+                    "selection_attempts": attempt,
+                },
+                sort_keys=True,
+            ),
+        )
     return StickySelectionOutcome(
         selection_inputs=selection_inputs,
         selected_snapshot=selected_snapshot,
