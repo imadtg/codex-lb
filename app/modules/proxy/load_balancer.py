@@ -1938,6 +1938,13 @@ class LoadBalancer:
                 primary_used=normalized_usage.primary_used,
             )
             routing_policy = _normalize_account_routing_policy(account.routing_policy)
+            # The repository context closes before the health CAS. Snapshot
+            # every ORM row that the post-close normalization still reads.
+            account = clone_row(account)
+            primary_entry = clone_row(primary_entry) if primary_entry is not None else None
+            effective_secondary_entry = (
+                clone_row(effective_secondary_entry) if effective_secondary_entry is not None else None
+            )
         # C2-3 resilience toggles: one dashboard snapshot before the lock.
         resilience = resolve_resilience_toggles(await get_settings_cache().get())
 

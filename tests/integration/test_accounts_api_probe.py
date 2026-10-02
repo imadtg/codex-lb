@@ -202,6 +202,35 @@ async def test_probe_active_account_returns_snapshot_when_advisory_settlement_fa
 
 
 @pytest.mark.asyncio
+async def test_probe_success_settles_against_real_balancer_after_repository_closes(async_client, monkeypatch, caplog):
+    """A successful route probe must settle even though repository rows detach."""
+    account_id = await _import_test_account(
+        async_client,
+        email="probe-real-settlement@example.com",
+        account_id="acc_probe_real_settlement",
+    )
+
+    async def _probe_succeeds(self, requested_account_id, model=None):
+        del self, model
+        response = AccountProbeResponse(
+            status="probed",
+            account_id=requested_account_id,
+            probe_status_code=200,
+            account_status_before="rate_limited",
+            account_status_after="active",
+        )
+        response._usage_refresh_fetch_succeeded = True
+        return response
+
+    monkeypatch.setattr(AccountsService, "probe_account", _probe_succeeds)
+    response = await async_client.post(f"/api/accounts/{account_id}/probe")
+
+    assert response.status_code == 200
+    assert response.json()["probeStatusCode"] == 200
+    assert "Force Probe advisory settlement failed" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_probe_success_skips_advisory_settlement_when_usage_refresh_fails(async_client, monkeypatch):
     record_probe_result = AsyncMock()
 

@@ -1601,7 +1601,16 @@ On the HTTP bridge / forwarded compact path the caller passes an `api_key_reserv
 
 After the operator Force Probe request and its immediate usage refresh complete, the system MUST report the result to the process-local load balancer. Before settling an HTTP 2xx response, the load balancer MUST reload the refreshed standard usage rows and apply the same elapsed-window, weekly-only-primary, zero-primary-capacity, plan-applicable monthly-window, and long-window normalization used by ordinary account selection. The settlement MUST apply only when replica-local runtime state has not changed since snapshot loading began, so a newer failure or other health observation cannot be cleared by an older probe result. An accepted 2xx settlement MUST count as one successful probe observation, clear replica-local transient error state, and advance the existing fixed probe-success state machine only when the normalized status and usage remain eligible to probe. Reaching the fixed success-streak requirement MUST return the account to `HEALTHY` routing.
 
+Account and usage rows used after the repository session closes MUST remain readable without that session.
+
 A non-2xx upstream response or the network-failure sentinel MUST NOT count as a successful observation and MUST reset an in-progress probe-success streak. Probe settlement MUST NOT override a persisted hard-blocked status or usage condition, invent a persistent account error, or change the Force Probe response schema.
+
+#### Scenario: Successful probe remains settleable after its database read closes
+
+- **GIVEN** a dashboard Force Probe receives HTTP 2xx and refreshes usage
+- **WHEN** the load balancer closes its repository read before taking the health-state lock
+- **THEN** settlement MUST evaluate the captured account and usage without a detached ORM access error
+- **AND** the health-version check MUST still prevent an older probe from erasing newer failures
 
 #### Scenario: Successful Force Probes rehabilitate a probing account
 
