@@ -61,10 +61,229 @@ async def coordinator(async_session_factory: Callable[[], AsyncSession]) -> Dura
     return DurableBridgeSessionCoordinator(async_session_factory)
 
 
+@pytest.mark.asyncio
+async def test_completed_legacy_history_discovery_is_scoped_read_only_and_not_capped(
+    coordinator: DurableBridgeSessionCoordinator,
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    def row(key: str, **overrides: str | int | None) -> HttpBridgeSessionRecord:
+        values = {
+            "id": key,
+            "session_key_kind": "internal_unanchored_parallel",
+            "session_key_value": key,
+            "session_key_hash": durable_bridge_hash(key),
+            "api_key_scope": "key-history",
+            "account_id": "acc-original",
+            "latest_response_id": f"resp-{key}",
+            "latest_input_item_count": 2,
+            "latest_input_full_fingerprint": "matching-prefix",
+            "state": HttpBridgeSessionState.CLOSED,
+        }
+        return HttpBridgeSessionRecord(**(values | overrides))
+
+    records = [
+        row("legacy-closed"),
+        row("legacy-model", session_key_kind="internal_model_parallel"),
+        row("other-scope", api_key_scope="other-key"),
+        row("canonical", session_key_kind="thread_header"),
+        row("unfinished", latest_response_id=None),
+        row("unproven", latest_input_full_fingerprint=None),
+        row("no-count", latest_input_item_count=None),
+        row("too-long", latest_input_item_count=4),
+        row("empty", latest_input_item_count=0),
+        row("detached", account_id=None, latest_response_id=None, latest_input_full_fingerprint=None),
+        *[row(f"unrelated-{index}", latest_input_full_fingerprint=f"unrelated-{index}") for index in range(300)],
+    ]
+    async with async_session_factory() as session:
+        session.add_all(records)
+        session.add(
+            HttpBridgeSessionAlias(
+                session_id="legacy-closed",
+                alias_kind="turn_state",
+                alias_value="legacy-token",
+                alias_hash=durable_bridge_hash("legacy-token"),
+                api_key_scope="key-history",
+            )
+        )
+        await session.commit()
+
+    # Exercise more than one SQL parameter chunk, with a repeated matching
+    # hash: discovery must return all proofs once and preserve their aliases.
+    fingerprints = ["matching-prefix", *[f"absent-{index}" for index in range(205)], "matching-prefix"]
+    found = await coordinator.lookup_completed_history_candidates(
+        api_key_id="key-history", input_item_count=4, prefix_fingerprints=fingerprints
+    )
+    assert {candidate.session_id for candidate in found} == {"legacy-closed", "legacy-model"}
+    assert len(found) == 2
+    assert all(candidate.state == HttpBridgeSessionState.CLOSED for candidate in found)
+    assert (
+        await coordinator.lookup_completed_history_candidates(
+            api_key_id="isolated", input_item_count=4, prefix_fingerprints=fingerprints
+        )
+        == []
+    )
+    assert (
+        await coordinator.lookup_completed_history_candidates(
+            api_key_id="key-history", input_item_count=4, prefix_fingerprints=[]
+        )
+        == []
+    )
+    async with async_session_factory() as session:
+        aliases = (await session.scalars(select(HttpBridgeSessionAlias))).all()
+        assert [(alias.session_id, alias.alias_hash) for alias in aliases] == [
+            ("legacy-closed", durable_bridge_hash("legacy-token"))
+        ]
+        preserved = await session.get(HttpBridgeSessionRecord, "legacy-closed")
+        assert preserved is not None and preserved.account_id == "acc-original"
+
+
 def test_durable_bridge_live_claim_requires_process_epoch() -> None:
     parameter = inspect.signature(DurableBridgeSessionCoordinator.claim_live_session).parameters["owner_process_epoch"]
 
     assert parameter.default is inspect.Parameter.empty
+
+
+@pytest.mark.asyncio
+async def test_completed_model_generation_is_scoped_and_preserves_explicit_anchors(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claims = []
+    for kind, key in (("thread_header", "thread-original"), ("internal_unanchored_parallel", "model-fork")):
+        claim = await coordinator.claim_live_session(
+            session_key_kind=kind,
+            session_key_value=key,
+            api_key_id="key-generation",
+            instance_id="instance-a",
+            owner_process_epoch="test-process",
+            lease_ttl_seconds=120.0,
+            account_id="acc-a",
+            model="gpt-6.1-sol",
+            service_tier=None,
+            latest_turn_state=None,
+            latest_response_id=None,
+            allow_takeover=True,
+        )
+        claims.append(claim)
+        assert (
+            await coordinator.register_previous_response_id(
+                session_id=claim.session_id,
+                api_key_id="key-generation",
+                instance_id="instance-a",
+                owner_epoch=claim.owner_epoch,
+                response_id=f"resp-{key}",
+                lease_ttl_seconds=120.0,
+                logical_thread_key="logical-thread",
+                input_item_count=3,
+                input_full_fingerprint=f"fingerprint-{key}",
+            )
+            == DurableBridgeAliasRegistration.REGISTERED
+        )
+    original, current = claims
+    await coordinator.register_turn_state(
+        session_id=original.session_id,
+        api_key_id="key-generation",
+        instance_id="instance-a",
+        owner_epoch=original.owner_epoch,
+        turn_state="turn-original",
+        lease_ttl_seconds=120.0,
+    )
+
+    async def lookup(
+        *,
+        api_key_id: str = "key-generation",
+        thread: str = "logical-thread",
+        turn: str | None = None,
+        response: str | None = None,
+    ) -> DurableBridgeLookup | None:
+        return await coordinator.lookup_request_targets(
+            session_key_kind="thread_header",
+            session_key_value="thread-original",
+            api_key_id=api_key_id,
+            turn_state=turn,
+            session_header=None,
+            previous_response_id=response,
+            logical_thread_key=thread,
+        )
+
+    inferred = await lookup()
+    assert inferred is not None and inferred.session_id == current.session_id
+    assert inferred.latest_input_full_fingerprint == "fingerprint-model-fork"
+    for explicit in (await lookup(turn="turn-original"), await lookup(response="resp-thread-original")):
+        assert explicit is not None and explicit.session_id == original.session_id
+    other_thread = await lookup(thread="other-logical-thread")
+    assert other_thread is not None and other_thread.session_id == original.session_id
+    assert await lookup(api_key_id="other-key") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_fenced", [True, False])
+async def test_failed_completion_does_not_publish_logical_generation(
+    coordinator: DurableBridgeSessionCoordinator,
+    owner_fenced: bool,
+) -> None:
+    protected_kind, protected_key = make_http_bridge_account_neutral_replay_key("completed-generation")
+    claims = []
+    for kind, key in ((protected_kind, protected_key), ("internal_unanchored_parallel", "failed-model-fork")):
+        claims.append(
+            await coordinator.claim_live_session(
+                session_key_kind=kind,
+                session_key_value=key,
+                api_key_id="key-generation-failure",
+                instance_id="instance-a",
+                owner_process_epoch="test-process",
+                lease_ttl_seconds=120.0,
+                account_id="acc-a",
+                model="gpt-6.1-sol",
+                service_tier=None,
+                latest_turn_state=None,
+                latest_response_id=None,
+                allow_takeover=True,
+            )
+        )
+    protected, rejected = claims
+    assert (
+        await coordinator.register_previous_response_id(
+            session_id=protected.session_id,
+            api_key_id="key-generation-failure",
+            instance_id="instance-a",
+            owner_epoch=protected.owner_epoch,
+            response_id="resp-protected-generation",
+            lease_ttl_seconds=120.0,
+            logical_thread_key="logical-thread",
+        )
+        == DurableBridgeAliasRegistration.REGISTERED
+    )
+    result = await coordinator.register_previous_response_id(
+        session_id=rejected.session_id,
+        api_key_id="key-generation-failure",
+        instance_id="instance-a",
+        owner_epoch=rejected.owner_epoch + int(owner_fenced),
+        response_id="resp-rejected" if owner_fenced else "resp-protected-generation",
+        lease_ttl_seconds=120.0,
+        logical_thread_key="logical-thread",
+    )
+    assert result == (
+        DurableBridgeAliasRegistration.OWNER_FENCED if owner_fenced else DurableBridgeAliasRegistration.ALIAS_PROTECTED
+    )
+    inferred = await coordinator.lookup_request_targets(
+        session_key_kind="request",
+        session_key_value="new-request",
+        api_key_id="key-generation-failure",
+        turn_state=None,
+        session_header=None,
+        previous_response_id=None,
+        logical_thread_key="logical-thread",
+    )
+    assert inferred is not None and inferred.session_id == protected.session_id
+    rejected_state = await coordinator.lookup_request_targets(
+        session_key_kind="internal_unanchored_parallel",
+        session_key_value="failed-model-fork",
+        api_key_id="key-generation-failure",
+        turn_state=None,
+        session_header=None,
+        previous_response_id=None,
+    )
+    assert rejected_state is not None and rejected_state.latest_response_id is None
 
 
 @pytest.mark.asyncio
@@ -750,7 +969,10 @@ async def test_durable_bridge_next_turn_prefers_verified_replay_over_shared_sess
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("predecessor_kind", ["prompt_cache", "session_header", "turn_state_header"])
+@pytest.mark.parametrize(
+    "predecessor_kind",
+    ["prompt_cache", "session_header", "thread_header", "turn_state_header", "internal_unanchored_parallel"],
+)
 async def test_durable_verified_replay_alias_cannot_be_stolen_by_predecessor(
     coordinator: DurableBridgeSessionCoordinator,
     predecessor_kind: str,

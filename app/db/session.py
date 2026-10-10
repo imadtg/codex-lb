@@ -11,7 +11,7 @@ import weakref
 from contextlib import asynccontextmanager
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Protocol, TypeVar, cast
 
 import anyio
 from anyio import to_thread
@@ -19,10 +19,16 @@ from sqlalchemy import event, text
 from sqlalchemy import util as sqlalchemy_util
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
 
 from app.core.config.settings import get_settings
 from app.core.utils.shared_future import _await_cleanup_deferring_cancellation
+from app.db.sqlite_ownership import (
+    OwnedSqliteSession,
+    drain_sqlite_operations,
+    install_sqlite_admission,
+    sqlite_writer_scope,
+)
 from app.db.sqlite_utils import (
     IntegrityCheck,
     SqliteFileIdentity,
@@ -40,6 +46,7 @@ from app.db.sqlite_utils import (
     sqlite_url_is_memory,
     write_sqlite_runstate,
 )
+from app.db.sqlite_writer_health import record_sqlite_busy, record_sqlite_write_success
 
 if TYPE_CHECKING:
     from app.db.migrate import MigrationRunResult, MigrationState
@@ -197,7 +204,10 @@ def _create_postgres_async_engine(url: str, *, role: _PostgresPooledEngineRole) 
 
 def _sqlite_file_async_engine_kwargs() -> dict[str, object]:
     return {
-        "poolclass": NullPool,
+        "poolclass": AsyncAdaptedQueuePool,
+        "pool_size": 4,
+        "max_overflow": 0,
+        "pool_timeout": _SQLITE_BUSY_TIMEOUT_SECONDS,
         "connect_args": {"timeout": _SQLITE_BUSY_TIMEOUT_SECONDS},
     }
 
@@ -215,6 +225,8 @@ def _configure_sqlite_engine(engine: Engine, *, enable_wal: bool) -> None:
         finally:
             cursor.close()
 
+    if enable_wal:
+        install_sqlite_admission(engine, timeout=_SQLITE_BUSY_TIMEOUT_SECONDS)
     _install_sqlite_long_write_watchdog(engine)
 
 
@@ -243,6 +255,7 @@ def _install_sqlite_long_write_watchdog(engine: Engine) -> None:
     """
 
     database_identity = str(Path(engine.url.database).resolve()) if engine.url.database else f"engine:{id(engine)}"
+    writer_database_path = sqlite_db_path_from_url(str(engine.url))
     last_busy_diagnostic_at = 0.0
 
     def _live_connection_info(conn: object) -> dict[str, object] | None:
@@ -333,6 +346,8 @@ def _install_sqlite_long_write_watchdog(engine: Engine) -> None:
                     return
             elif "database is locked" not in str(original).lower():
                 return
+            if writer_database_path is not None:
+                record_sqlite_busy(writer_database_path)
             now = time.monotonic()
             if now - last_busy_diagnostic_at < _SQLITE_BUSY_DIAGNOSTIC_INTERVAL_SECONDS:
                 return
@@ -448,6 +463,12 @@ def _install_sqlite_long_write_watchdog(engine: Engine) -> None:
     def _finalize_on_checkin(dbapi_connection: object, connection_record: object) -> None:
         info = getattr(connection_record, "info", None)
         if info is not None:
+            if (
+                dbapi_connection is not None
+                and "sqlite_write_pending_report" in info
+                and writer_database_path is not None
+            ):
+                record_sqlite_write_success(writer_database_path)
             _finalize_pending_report(info)
 
     @event.listens_for(engine, "handle_error")
@@ -490,11 +511,16 @@ def _create_main_engine(url: str) -> AsyncEngine:
 
 engine = _create_main_engine(_database_url)
 
-SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+SessionLocal = async_sessionmaker(
+    engine,
+    expire_on_commit=False,
+    class_=OwnedSqliteSession
+    if _is_sqlite_url(_database_url) and not _is_sqlite_memory_url(_database_url)
+    else AsyncSession,
+)
 
 _background_engine: AsyncEngine | None = None
 _background_session_factory: async_sessionmaker[AsyncSession] | None = None
-_sqlite_writer_lock: anyio.Lock | None = None
 _sqlite_lifetime_lock: sqlite3.Connection | None = None
 _sqlite_lifetime_lock_path: Path | None = None
 
@@ -995,6 +1021,9 @@ async def _finish_bounded_teardown(
 
 
 async def _safe_rollback(session: AsyncSession) -> None:
+    if isinstance(session, OwnedSqliteSession):
+        await cast(AsyncSession, session).rollback()
+        return
     if not session.in_transaction():
         return
     if _session_is_teardown_wedged(session):
@@ -1026,6 +1055,9 @@ async def _safe_rollback(session: AsyncSession) -> None:
 
 
 async def _safe_close(session: AsyncSession) -> None:
+    if isinstance(session, OwnedSqliteSession):
+        await cast(AsyncSession, session).close()
+        return
     if _session_is_teardown_wedged(session):
         # Deferred cleanup owns the session now; see _finish_abandoned_teardown.
         return
@@ -1116,7 +1148,11 @@ def init_background_db(url: str | None = None) -> None:
             role=_PostgresPooledEngineRole.BACKGROUND_TASK,
         )
 
-    _background_session_factory = async_sessionmaker(_background_engine, expire_on_commit=False, class_=AsyncSession)
+    _background_session_factory = async_sessionmaker(
+        _background_engine,
+        expire_on_commit=False,
+        class_=OwnedSqliteSession if _is_sqlite_url(db_url) and not _is_sqlite_memory_url(db_url) else AsyncSession,
+    )
 
 
 @asynccontextmanager
@@ -1171,15 +1207,8 @@ async def relax_commit_durability(session: AsyncSession) -> None:
 
 @asynccontextmanager
 async def sqlite_writer_section() -> AsyncIterator[None]:
-    """Serialize local SQLite write transactions without throttling upstream work."""
-    global _sqlite_writer_lock
-    database_url = normalize_sqlite_url(_settings.database_url)
-    if not _is_sqlite_url(database_url) or _is_sqlite_memory_url(database_url):
-        yield
-        return
-    if _sqlite_writer_lock is None:
-        _sqlite_writer_lock = anyio.Lock()
-    async with _sqlite_writer_lock:
+    """Admit the first statement, including mutation predicates, as a writer."""
+    async with sqlite_writer_scope():
         yield
 
 
@@ -1377,6 +1406,9 @@ async def init_db() -> None:
 
 async def close_db() -> bool:
     """Dispose database engines and report whether SQLite teardown fully drained."""
+    if not await drain_sqlite_operations(2 * _SQLITE_TEARDOWN_TIMEOUT_SECONDS):
+        logger.warning("close_db left running SQLite operations owned; shutdown is unclean")
+        return False
     loop = asyncio.get_running_loop()
     # A teardown reclaimed as wedged can finish while engine disposal is in
     # progress and register its bookkeeping close from a done callback. Use

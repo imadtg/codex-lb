@@ -186,7 +186,10 @@ from app.modules.proxy._service.observability import (
 from app.modules.proxy._service.observability import (
     record_http_bridge_routing,
 )
-from app.modules.proxy._service.response_create import _stored_context_prefix_fingerprints
+from app.modules.proxy._service.response_create import (
+    _input_context_prefix_fingerprints,
+    _stored_context_prefix_fingerprints,
+)
 from app.modules.proxy._service.support import (
     _ACCOUNT_SELECTION_RECOVERY_HEARTBEAT_SECONDS,
     _HARD_HTTP_BRIDGE_AFFINITY_KINDS,  # noqa: F401
@@ -265,7 +268,11 @@ from app.modules.proxy.continuity import (
 )
 from app.modules.proxy.continuity_diagnostics import record_continuity_decision
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup
-from app.modules.proxy.durable_bridge_repository import durable_bridge_hash
+from app.modules.proxy.durable_bridge_repository import (
+    durable_bridge_api_key_scope,
+    durable_bridge_hash,
+    durable_bridge_operation_fingerprint,
+)
 from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_epoch
 from app.modules.proxy.helpers import (
     _normalize_error_code,
@@ -523,6 +530,90 @@ def _verify_durable_full_resend(
     if durable_lookup is None or durable_lookup.account_id is None or durable_lookup.latest_response_id is None:
         return None
     return _VerifiedDurableFullResend._verify(payload, durable_lookup)
+
+
+def _replay_projection_retains_required_context(
+    replay_projection: AccountNeutralReplayProjection,
+    lookup: DurableBridgeLookup,
+) -> bool:
+    return responses_input_suffix_retains_prior_output(
+        replay_projection.input_items,
+        stored_count=replay_projection.stored_prefix_count,
+        canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+        fingerprint_verified_prefix=True,
+    ) or (
+        lookup.latest_pending_tool_calls is not None
+        and responses_input_suffix_matches_pending_tool_calls(
+            replay_projection.input_items,
+            stored_count=replay_projection.stored_prefix_count,
+            pending_tool_calls=lookup.latest_pending_tool_calls,
+            canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+            fingerprint_verified_prefix=True,
+        )
+    )
+
+
+def _unique_portable_history_source(
+    payload: ResponsesRequest,
+    candidates: list[DurableBridgeLookup],
+) -> DurableBridgeLookup | None:
+    """Identify context evidence; this never proves a thread or account owner."""
+    if payload.previous_response_id is not None or not isinstance(payload.input, list):
+        return None
+    matching: DurableBridgeLookup | None = None
+    for candidate in candidates:
+        stored_count = candidate.latest_input_item_count
+        if stored_count is None or not _input_prefix_matches_stored_context(
+            payload.input,
+            stored_count=stored_count,
+            stored_fingerprint=candidate.latest_input_full_fingerprint,
+        ):
+            continue
+        projection = project_responses_input_for_account_neutral_fresh_replay(
+            cast(list[JsonValue], payload.input),
+            stored_count=stored_count,
+            preserve_developer_message_ids=True,
+        )
+        if projection is None or not _replay_projection_retains_required_context(projection, candidate):
+            continue
+        if candidate.latest_pending_tool_calls:
+            if not responses_input_suffix_matches_pending_tool_calls(
+                projection.input_items,
+                stored_count=projection.stored_prefix_count,
+                pending_tool_calls=candidate.latest_pending_tool_calls,
+                canonical_lite_developer_index=projection.canonical_lite_developer_index,
+                fingerprint_verified_prefix=True,
+            ):
+                continue
+        fresh_projection = project_responses_input_for_account_neutral_fresh_replay(
+            cast(list[JsonValue], payload.input), stored_count=stored_count
+        )
+        if fresh_projection is None or not _http_bridge_payload_is_account_neutral_fresh_replay(
+            payload.model_copy(update={"input": fresh_projection.input_items})
+        ):
+            continue
+        if matching is not None:
+            return None
+        matching = candidate
+    return matching
+
+
+def _portable_history_operation_fingerprint(
+    *,
+    request_text: str,
+    api_key_scope: str,
+    client_scope: str | None,
+    preserve_prompt_cache_key: bool,
+) -> str:
+    frame = cast(dict[str, JsonValue], json.loads(request_text))
+    if not preserve_prompt_cache_key:
+        # Derived cache keys are process-local locality, not execution identity.
+        frame.pop("prompt_cache_key", None)
+    identity = {"kind": "portable_history_v1", "client_scope": client_scope, "request": frame}
+    return durable_bridge_operation_fingerprint(
+        api_key_scope=api_key_scope,
+        request_text=json.dumps(identity, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+    )
 
 
 _HTTP_BRIDGE_DEAD_OWNER_NOT_FOUND_DETAIL = "The previous bridge owner is no longer available."
@@ -1384,6 +1475,7 @@ class _HTTPBridgeStreamingMixin:
             return lifecycle
 
         replay_client_input: list[JsonValue] | None = None
+        portable_history_operation_fingerprint: str | None = None
 
         def prepare_bridge_request(
             request_payload: ResponsesRequest,
@@ -1416,6 +1508,9 @@ class _HTTPBridgeStreamingMixin:
             request_state.deferred_account_backoff_tracker = deferred_account_backoff_tracker
             request_state.deferred_account_backoff_lifecycle = lifecycle
             request_state.durable_owner_dead = dead_owner_anchor
+            if portable_history_operation_fingerprint is not None:
+                request_state.operation_fence_required = True
+                request_state.operation_fingerprint = portable_history_operation_fingerprint
             if replay_client_input is not None:
                 # Wire projection strips response IDs/bookkeeping, but the
                 # next client request still carries its original history.
@@ -1527,6 +1622,7 @@ class _HTTPBridgeStreamingMixin:
                     # Exact turn/response aliases remain independent inputs.
                     session_header=durable_session_header_alias,
                     previous_response_id=payload.previous_response_id,
+                    logical_thread_key=_codex_backend_identity(headers).thread_selection_key,
                 )
             except ProxyResponseError:
                 # Conflicting durable aliases are a continuity decision, not a
@@ -1622,26 +1718,6 @@ class _HTTPBridgeStreamingMixin:
         # wedged reattach through the session-state side door.
         fresh_reattach_anchor_suppressed_quarantined = False
 
-        def replay_projection_retains_required_context(
-            replay_projection: AccountNeutralReplayProjection,
-            lookup: DurableBridgeLookup,
-        ) -> bool:
-            return responses_input_suffix_retains_prior_output(
-                replay_projection.input_items,
-                stored_count=replay_projection.stored_prefix_count,
-                canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                fingerprint_verified_prefix=True,
-            ) or (
-                lookup.latest_pending_tool_calls is not None
-                and responses_input_suffix_matches_pending_tool_calls(
-                    replay_projection.input_items,
-                    stored_count=replay_projection.stored_prefix_count,
-                    pending_tool_calls=lookup.latest_pending_tool_calls,
-                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                    fingerprint_verified_prefix=True,
-                )
-            )
-
         def classify_durable_full_resend(
             lookup: DurableBridgeLookup,
         ) -> tuple[int | None, str | None, bool, _AccountNeutralReplayRejection | None]:
@@ -1683,7 +1759,7 @@ class _HTTPBridgeStreamingMixin:
             )
             safe_fresh_context = False
             if replay_projection is not None:
-                safe_fresh_context = replay_projection_retains_required_context(replay_projection, lookup)
+                safe_fresh_context = _replay_projection_retains_required_context(replay_projection, lookup)
             record_proof(
                 "context_proven"
                 if safe_fresh_context
@@ -1692,6 +1768,28 @@ class _HTTPBridgeStreamingMixin:
                 else "retained_output_unproven"
             )
             return stored_count, lookup.latest_input_full_fingerprint, safe_fresh_context, None
+
+        history_recovery_source: DurableBridgeLookup | None = None
+        if (
+            not forwarded_request
+            and incoming_turn_state_header is None
+            and payload.previous_response_id is None
+            and rewritten_file_account_id is None
+            and payload_looks_like_full_resend
+            and isinstance(payload.input, list)
+            and durable_full_resend_proof is None
+            and not affinity.abandon_unavailable_legacy_owner
+        ):
+            candidates = await self._durable_bridge.lookup_completed_history_candidates(
+                api_key_id=bridge_session_key.api_key_id,
+                input_item_count=len(payload.input),
+                prefix_fingerprints=_input_context_prefix_fingerprints(cast(list[JsonValue], payload.input)),
+            )
+            history_recovery_source = _unique_portable_history_source(payload, candidates)
+            if history_recovery_source is not None:
+                # Use the completed context proof, not its owner identity.
+                # Routing and anchor injection are disabled below.
+                durable_lookup = history_recovery_source
 
         if durable_lookup is not None:
             (
@@ -1755,6 +1853,10 @@ class _HTTPBridgeStreamingMixin:
         # Transport isolation must not discard the source context used to
         # decide whether an unavailable owner can be replaced safely.
         durable_replay_context_lookup = durable_lookup
+        if history_recovery_source is not None:
+            durable_lookup = None
+            dead_owner_anchor = False
+            dead_owner_process_epoch_mismatch = False
         durable_model_transition_lookup = (
             durable_lookup
             if durable_lookup is not None and not _http_bridge_models_compatible(durable_lookup.model, payload.model)
@@ -2184,7 +2286,7 @@ class _HTTPBridgeStreamingMixin:
                         "account_scoped_input" if durable_replay_context_lookup is not None else "no_durable_lookup"
                     )
                     return False
-                durable_full_resend_retains_required_context_cache = replay_projection_retains_required_context(
+                durable_full_resend_retains_required_context_cache = _replay_projection_retains_required_context(
                     eligibility_projection,
                     durable_replay_context_lookup,
                 )
@@ -2335,6 +2437,10 @@ class _HTTPBridgeStreamingMixin:
             if not _http_bridge_is_previous_response_owner_unavailable(exc):
                 return False
             if payload.previous_response_id is not None or rewritten_file_account_id is not None:
+                return False
+            if durable_full_resend_proof is not None:
+                # A same-owner proof does not authorize abandoning that owner.
+                # The separate neutral projection path can move portable input.
                 return False
             retiring_account_id = request_state.preferred_account_id
             if durable_lookup is None or retiring_account_id is None:
@@ -2511,6 +2617,21 @@ class _HTTPBridgeStreamingMixin:
             dead_owner_process_epoch_mismatch = False
             file_required_preferred_account = False
 
+        if history_recovery_source is not None and durable_full_resend_allows_account_neutral_replay():
+            switch_to_account_neutral_replay(
+                event="legacy_history_fresh_resend",
+                detail="outcome=portable_context_without_owner_inference",
+                exclude_failed_owner=False,
+            )
+            portable_history_operation_fingerprint = _portable_history_operation_fingerprint(
+                request_text=text_data,
+                api_key_scope=durable_bridge_api_key_scope(bridge_session_key.api_key_id),
+                client_scope=_codex_backend_identity(headers).thread_selection_key or incoming_session_header,
+                preserve_prompt_cache_key=explicit_prompt_cache_key is not None,
+            )
+            request_state.operation_fence_required = True
+            request_state.operation_fingerprint = portable_history_operation_fingerprint
+
         if (
             durable_lookup is not None
             and durable_lookup.state != HttpBridgeSessionState.ACTIVE
@@ -2612,7 +2733,10 @@ class _HTTPBridgeStreamingMixin:
                     request_stage=request_state.request_stage,
                     preferred_account_id=request_state.preferred_account_id,
                     preferred_account_has_continuity_provenance=preferred_account_has_continuity_provenance,
-                    fallback_on_preferred_account_unavailable=not file_required_preferred_account,
+                    fallback_on_preferred_account_unavailable=not (
+                        file_required_preferred_account
+                        or (durable_full_resend_proof is not None and not account_neutral_recovery)
+                    ),
                     request_usage_budget=request_state.request_usage_budget,
                     request_deadline=request_deadline,
                     session_header_fallback_key=session_header_fallback_key,

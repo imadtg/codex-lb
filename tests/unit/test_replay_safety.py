@@ -2091,6 +2091,33 @@ def test_full_resend_retained_output_rejects_unproven_fresh_developer_followup(
     )
 
 
+@pytest.mark.parametrize(
+    ("content", "has_user", "phase", "expected"),
+    [
+        ([{"type": "input_text", "text": "model settings"}], True, "final_answer", True),
+        ([{"type": "input_file", "file_id": "file-owner"}], True, "final_answer", False),
+        ([{"type": "encrypted_content", "encrypted_content": "opaque"}], True, "final_answer", False),
+        ([{"type": "input_text", "text": "model settings"}], False, "final_answer", False),
+        ([{"type": "input_text", "text": "model settings"}], True, "commentary", False),
+    ],
+)
+def test_developer_block_requires_portable_instructions_and_settled_user_boundary(
+    content: list[JsonValue],
+    has_user: bool,
+    phase: str,
+    expected: bool,
+) -> None:
+    items: list[JsonValue] = [
+        {"role": "user", "content": "initial question"},
+        {"role": "assistant", "phase": phase, "content": [{"type": "output_text", "text": "prior answer"}]},
+        {"role": "developer", "content": [{"type": "input_text", "text": "harness settings"}]},
+        {"role": "developer", "content": content},
+    ]
+    if has_user:
+        items.append({"role": "user", "content": "continue"})
+    assert responses_input_suffix_retains_prior_output(items, stored_count=1) is expected
+
+
 def test_full_resend_retained_output_rejects_complete_tool_pair_between_output_and_user() -> None:
     stored_prefix: list[JsonValue] = [
         {

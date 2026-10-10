@@ -221,6 +221,7 @@ from app.modules.proxy._service.warmup import (
 )
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
+    _codex_backend_identity,
     _extract_model_class,
     _owner_lookup_session_id_from_headers,
     _sticky_key_from_turn_state_header,
@@ -732,6 +733,7 @@ class _HTTPBridgeRequestSubmitMixin:
             request_state.conversation_id,
         ) = _request_log_client_fields(headers)
         request_state.client_ip = client_ip
+        request_state.logical_thread_key = _codex_backend_identity(headers).thread_selection_key
         return request_state, text_data
 
     def _prepare_response_bridge_request_state(
@@ -1291,6 +1293,8 @@ class _HTTPBridgeRequestSubmitMixin:
             callable(record_operation)
             and (
                 request_state.previous_response_id is not None
+                or request_state.hard_continuity_anchor
+                or request_state.operation_fence_required
                 or request_state.operation_rebind_required
                 or recovery_attempt_consumed
             )
@@ -1302,7 +1306,8 @@ class _HTTPBridgeRequestSubmitMixin:
             api_key_scope = durable_bridge_api_key_scope(session.key.api_key_id)
             operation_fingerprint = (
                 request_state.operation_fingerprint
-                if request_state.operation_rebind_required and request_state.operation_fingerprint is not None
+                if (request_state.operation_rebind_required or request_state.operation_fence_required)
+                and request_state.operation_fingerprint is not None
                 else _http_bridge_operation_fingerprint(
                     session_id=session.durable_session_id,
                     api_key_scope=api_key_scope,
@@ -1398,7 +1403,7 @@ class _HTTPBridgeRequestSubmitMixin:
                     # anchor instead of replaying the timed-out turn. Re-run
                     # the operation lookup after this race-path advancement so
                     # two completions observed back-to-back are both walked.
-                    if existing_operation is None:
+                    if existing_operation is None and not request_state.operation_fence_required:
                         get_latest_completed = getattr(self._durable_bridge, "get_latest_completed_operation", None)
                         if callable(get_latest_completed):
                             completed_operation = await _call_with_supported_optional_kwargs(

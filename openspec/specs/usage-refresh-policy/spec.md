@@ -1845,26 +1845,7 @@ Auth Guardian MUST preserve stable account identities while its candidate-query 
 
 ### Requirement: Streaming usage-limit failures request an immediate coalesced usage refresh
 
-When an upstream stream fails with the error code `usage_limit_reached`, the proxy
-MUST request an immediate usage refresh for the failing account in addition to
-marking it rate limited. The refresh MUST run as a tracked background task that
-never blocks or alters the response, MUST load the account from a fresh
-background-session row rather than the request's `Account` instance, and MUST
-bypass the usage freshness gate. Usage refreshes run on two per-account
-singleflight lanes: the background scheduler and forced refreshes use the bare
-account key with caller-bound sessions, while the rate-limit payload, fleet and
-request-triggered refreshes use the owned-session key. A requested refresh MUST
-join a refresh already in flight on either lane rather than starting a third
-concurrent upstream fetch, and concurrent requests for the same account MUST
-share a single in-flight owned-session refresh without queueing a successor
-fetch. Repeated requests for the same account within a fixed 15 second window
-MUST be dropped. The request MUST be
-skipped when usage refresh is disabled, when the account is in usage-refresh auth
-cooldown, or when the fresh row is missing, `paused`, `reauth_required`, or
-`deactivated`. When the requested (or joined) refresh writes usage rows it MUST
-invalidate the account selection cache, so the next selection observes the new
-usage evidence without waiting out the cache TTL. Plain `rate_limit_exceeded`
-throttling and quota error codes MUST NOT request a refresh.
+When an upstream stream fails with a rejection that proves the account's usage limit is spent, the proxy MUST request an immediate usage refresh for the failing account in addition to marking it rate limited. The trigger is that rejection, not the literal error code: upstream proves the same condition with the code `usage_limit_reached` and, on the code-less delivery form, with the message alone, and the account whose window is spent is owed the same refresh either way. The refresh MUST run as a tracked background task that never blocks or alters the response, MUST load the account from a fresh background-session row rather than the request's `Account` instance, and MUST bypass the usage freshness gate. Usage refreshes run on two per-account singleflight lanes: the background scheduler and forced refreshes use the bare account key with caller-bound sessions, while the rate-limit payload, fleet and request-triggered refreshes use the owned-session key. A requested refresh MUST join a refresh already in flight on either lane rather than starting a third concurrent upstream fetch, and concurrent requests for the same account MUST share a single in-flight owned-session refresh without queueing a successor fetch. Repeated requests for the same account within a fixed 15 second window MUST be dropped. The request MUST be skipped when usage refresh is disabled, when the account is in usage-refresh auth cooldown, or when the fresh row is missing, `paused`, `reauth_required`, or `deactivated`. When the requested (or joined) refresh writes usage rows it MUST invalidate the account selection cache, so the next selection observes the new usage evidence without waiting out the cache TTL. Plain `rate_limit_exceeded` throttling and quota error codes MUST NOT request a refresh.
 
 #### Scenario: A 429 storm produces a single upstream fetch
 
@@ -1916,6 +1897,19 @@ throttling and quota error codes MUST NOT request a refresh.
 - **GIVEN** usage refresh is disabled, or the account is in auth cooldown, or its fresh row is missing, `paused`, `reauth_required`, or `deactivated`
 - **WHEN** a stream on that account fails with `usage_limit_reached`
 - **THEN** no upstream usage fetch runs
+
+#### Scenario: A message-derived usage limit requests the same refresh
+
+- **GIVEN** an upstream stream fails with an envelope carrying no error code whose message asserts the account's usage limit has been reached
+- **WHEN** the proxy records account health for it
+- **THEN** it requests the immediate coalesced usage refresh exactly as it does for the `usage_limit_reached` code
+- **AND** the same debounce window, singleflight lanes and eligibility skips apply
+
+#### Scenario: Throttling and quota codes still do not refresh
+
+- **GIVEN** an upstream stream fails with `rate_limit_exceeded` carrying no usage-limit message, or with a quota error code
+- **WHEN** the proxy records account health for it
+- **THEN** no usage refresh is requested
 
 ### Requirement: Permanent refresh failure preserves request eligibility
 

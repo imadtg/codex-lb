@@ -904,13 +904,14 @@ async def test_run_if_leader_demotes_when_renewal_hangs(monkeypatch: pytest.Monk
         def __init__(self) -> None:
             super().__init__("postgresql", [1])
             self.calls = 0
+            self.unblock = asyncio.Event()
 
         async def execute(self, statement: Any, params: Any = None) -> _FakeResult:
             self.calls += 1
             if self.calls == 1:
                 return await super().execute(statement, params)
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
+            await self.unblock.wait()
+            return _FakeResult(1, self._remaining)
 
     session = _HangingRenewSession()
     _install(monkeypatch, session, ttl=3)
@@ -936,7 +937,11 @@ async def test_run_if_leader_demotes_when_renewal_hangs(monkeypatch: pytest.Monk
     # Two time-boxed attempts (interval 1s + timeout 1s each) demote by ~4s,
     # i.e. within the 3s TTL plus scheduling slack — never the pool timeout.
     assert loop.time() - start < 6.0
-    assert session.calls >= 3
+    assert session.calls == 2  # acquire plus one shared, still-owned renewal
+    assert election._renewal_owner is not None
+    session.unblock.set()
+    assert not await asyncio.wait_for(election._renewal_owner, timeout=1)
+    assert election._lease_deadline is None
 
 
 @pytest.mark.asyncio
@@ -994,14 +999,12 @@ async def test_run_if_leader_demotes_when_renewal_cancellation_hangs(monkeypatch
     # Demotion happened on the time-box deadlines (~4s for ttl=3), not after
     # the still-hung renewal finished unwinding (which never happens here).
     assert loop.time() - start < 6.0
-    assert session.calls >= 3
-    # The stalled renewal was abandoned, not awaited.
-    assert election._abandoned_renewals
-
-    # Release the abandoned renewal task(s) so the loop can finalize cleanly.
+    assert session.calls == 2  # acquire plus one shared, still-owned renewal
+    # Observers detached; exactly one driver owner remains and is fenced.
+    assert election._renewal_owner is not None and not election._renewal_owner.done()
     unblock.set()
-    if election._abandoned_renewals:
-        await asyncio.wait(set(election._abandoned_renewals), timeout=1)
+    assert not await asyncio.wait_for(election._renewal_owner, timeout=1)
+    assert election._lease_deadline is None
 
 
 @pytest.mark.asyncio
@@ -1287,13 +1290,14 @@ async def test_run_if_leader_demotes_by_deadline_when_renewal_stalls_near_deadli
         def __init__(self) -> None:
             super().__init__("postgresql", [])
             self.execute_calls = 0
+            self.unblock = asyncio.Event()
 
         async def execute(self, statement: Any, params: Any = None) -> _FakeResult:
             self.execute_calls += 1
             if self.execute_calls == 1:
                 raise RuntimeError("db down")  # acquire fails -> preserve held lease
-            await asyncio.Event().wait()  # renewal stalls indefinitely
-            raise AssertionError("unreachable")
+            await self.unblock.wait()
+            return _FakeResult(1, self._remaining)
 
     session = _StallingRenewSession()
     _install(monkeypatch, session, ttl=ttl)
@@ -1331,10 +1335,12 @@ async def test_run_if_leader_demotes_by_deadline_when_renewal_stalls_near_deadli
     # second renewal fires (unlike the instantly-failing case, which retries).
     assert session.execute_calls == 2
 
-    # Drain any still-pending abandoned renewal task so the loop finalizes
-    # cleanly (it may already have been discarded once its cancellation unwound).
-    if election._abandoned_renewals:
-        await asyncio.wait(set(election._abandoned_renewals), timeout=1)
+    # The observer detached at the deadline; release the driver owner and
+    # verify that its late result cannot promote the demoted election.
+    assert election._renewal_owner is not None
+    session.unblock.set()
+    assert not await asyncio.wait_for(election._renewal_owner, timeout=1)
+    assert election._lease_deadline is None
 
 
 @pytest.mark.asyncio

@@ -330,7 +330,6 @@ from app.modules.proxy._service.observability import (
 from app.modules.proxy._service.observability import (
     _truncate_identifier as _truncate_identifier,
 )
-from app.modules.proxy.continuity_diagnostics import record_tool_output_delta_observation
 from app.modules.proxy._service.support import (
     _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE,
     _HARD_HTTP_BRIDGE_AFFINITY_KINDS,  # noqa: F401
@@ -489,6 +488,7 @@ from app.modules.proxy.capability_routing import (
     strip_capability_metadata,
 )
 from app.modules.proxy.continuity import resolve_required_account_id
+from app.modules.proxy.continuity_diagnostics import record_tool_output_delta_observation
 from app.modules.proxy.durable_bridge_coordinator import (
     DurableBridgeLookup as DurableBridgeLookup,
 )
@@ -3287,12 +3287,10 @@ class _WebSocketMixin:
             tool_call_types = {"function_call", "custom_tool_call", "apply_patch_call"}
             tool_output_types = {"function_call_output", "custom_tool_call_output", "apply_patch_call_output"}
             tool_calls = sum(
-                isinstance(item, dict) and item.get("type") in tool_call_types
-                for item in responses_payload.input
+                isinstance(item, dict) and item.get("type") in tool_call_types for item in responses_payload.input
             )
             tool_outputs = sum(
-                isinstance(item, dict) and item.get("type") in tool_output_types
-                for item in responses_payload.input
+                isinstance(item, dict) and item.get("type") in tool_output_types for item in responses_payload.input
             )
             if tool_outputs:
                 record_tool_output_delta_observation(
@@ -3413,6 +3411,7 @@ class _WebSocketMixin:
         original_full_resend_input: JsonValue | None = None
         if session_anchor is not None:
             request_state.proxy_injected_previous_response_id = True
+            request_state.fresh_upstream_request_stored_input_count = session_anchor.stored_input_item_count
             request_state.input_item_count = original_input_item_count or request_state.input_item_count
             request_state.input_full_fingerprint = original_input_fingerprint
             if original_full_resend_payload is not None:
@@ -6102,12 +6101,11 @@ class _WebSocketMixin:
                     request_state.affinity_policy = replace(request_state.affinity_policy, reallocate_sticky=True)
                 upstream_control.suppress_downstream_event = True
                 upstream_control.replay_request_state = request_state
-                if accepted_lifecycle_replay:
-                    # The accepted request still holds its API-key reservation:
-                    # the health write waits for its settlement (bridge parity).
-                    # Pre-created replays keep the immediate write; they are not
-                    # excluded from the reconnect and rely on the penalty to
-                    # steer selection away from this account.
+                if accepted_lifecycle_replay or (
+                    retry_safe_owner_replay and request_state.api_key_reservation is not None
+                ):
+                    # Replays keep their reservation open until finalization.
+                    # Health writes must wait for settlement, even before created.
                     await _record_or_defer_websocket_accepted_replay_health(
                         proxy,
                         request_state,
@@ -6542,7 +6540,9 @@ class _WebSocketMixin:
             settlement.record_success = False
         if event_type in {"response.failed", "error"}:
             _observe_terminal_stream_error_frame(error_code, error_message)
-            settlement.account_health_error = _facade()._should_penalize_stream_error(error_code) and not getattr(
+            settlement.account_health_error = _facade()._should_penalize_stream_error(
+                error_code, error_message
+            ) and not getattr(
                 request_state,
                 "account_health_error_handled",
                 False,

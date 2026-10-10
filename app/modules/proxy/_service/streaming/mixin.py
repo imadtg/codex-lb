@@ -409,6 +409,7 @@ from app.modules.proxy.helpers import (
     _parse_openai_error,
     _upstream_error_from_openai,
     is_upstream_model_capacity_error,
+    is_upstream_usage_limit_rejection,
 )
 from app.modules.proxy.http_bridge_forwarding import (
     HTTPBridgeForwardContext as HTTPBridgeForwardContext,
@@ -725,7 +726,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                         failure_metadata = _RequestLogFailureMetadata(
                             failure_phase="upstream", failure_detail="upstream_eof_before_terminal_event"
                         )
-                    settlement.account_health_error = _facade()._should_penalize_stream_error(code)
+                    settlement.account_health_error = _facade()._should_penalize_stream_error(code, error_message)
                     if allow_retry and code == "stream_idle_timeout":
                         raise _RetryableStreamError(code, upstream_error, exclude_account=True)
                     if allow_retry and _facade()._is_security_work_authorization_required_error(code, error_message):
@@ -734,7 +735,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                             _facade()._SECURITY_WORK_AUTHORIZATION_REQUIRED_CODE,
                             upstream_error,
                         )
-                    if allow_retry and _facade()._should_retry_stream_error(code):
+                    if allow_retry and _facade()._should_retry_stream_error(code, error_message):
                         raise _RetryableStreamError(code, upstream_error, exclude_account=True)
                 terminal_stream_error = _TerminalStreamError(
                     error_code or code,
@@ -902,10 +903,16 @@ class _StreamingMixin(_StreamingRetryMixin):
                                     failure_detail="upstream_eof_before_terminal_event",
                                 )
                             if preserve_raw_sse_line and error is None:
-                                settlement.account_health_error = not saw_text_delta
-                            else:
                                 settlement.account_health_error = (
-                                    _facade()._should_penalize_stream_error(error_code) and not saw_text_delta
+                                    not saw_text_delta
+                                    or is_upstream_usage_limit_rejection(error_code=error_code, message=error_message)
+                                )
+                            else:
+                                settlement.account_health_error = _facade()._should_penalize_stream_error(
+                                    error_code, error_message
+                                ) and (
+                                    not saw_text_delta
+                                    or is_upstream_usage_limit_rejection(error_code=error_code, message=error_message)
                                 )
                 elif preserve_raw_sse_line:
                     _, raw_error_message, _, raw_error_code = _raw_error_fields(
@@ -918,7 +925,9 @@ class _StreamingMixin(_StreamingRetryMixin):
                     error_message = raw_error_message
                     settlement.error = {"message": raw_error_message or "Upstream error"}
                     settlement.record_success = False
-                    settlement.account_health_error = not saw_text_delta
+                    settlement.account_health_error = not saw_text_delta or is_upstream_usage_limit_rejection(
+                        error_code=error_code, message=error_message
+                    )
                 if event_type in ("response.completed", "response.incomplete"):
                     response = event.response if event is not None else None
                     usage = response.usage if response else None
@@ -968,8 +977,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                     )
                 ):
                     _facade().logger.info(
-                        "stream_accepted_capacity_retry request_id=%s account_id=%s "
-                        "buffered_events=%s code=%s",
+                        "stream_accepted_capacity_retry request_id=%s account_id=%s buffered_events=%s code=%s",
                         request_id,
                         account_id_value,
                         len(buffered_capacity_prefix),
@@ -1034,7 +1042,7 @@ class _StreamingMixin(_StreamingRetryMixin):
             )
             error_message = error.message if error else None
             settlement.record_success = False
-            settlement.account_health_error = _facade()._should_penalize_stream_error(error_code)
+            settlement.account_health_error = _facade()._should_penalize_stream_error(error_code, error_message)
             raise
         except UpstreamProxyRouteError as exc:
             route_fail_closed_reason = exc.reason

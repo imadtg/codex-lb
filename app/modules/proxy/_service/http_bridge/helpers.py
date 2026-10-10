@@ -2954,6 +2954,7 @@ async def _persist_http_bridge_previous_response_alias(
     instance_id: str,
     lease_ttl_seconds: float,
     local_alias_was_published: bool = True,
+    logical_thread_key: str | None = None,
 ) -> DurableBridgeAliasRegistration | None:
     owner_epoch = session.durable_owner_epoch
     try:
@@ -2967,6 +2968,7 @@ async def _persist_http_bridge_previous_response_alias(
             input_item_count=input_item_count,
             input_full_fingerprint=input_full_fingerprint,
             pending_tool_calls=pending_tool_calls,
+            **({"logical_thread_key": logical_thread_key} if logical_thread_key is not None else {}),
         )
     except Exception:
         logger.warning("Failed to persist durable HTTP bridge previous_response_id alias", exc_info=True)

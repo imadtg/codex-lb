@@ -12,13 +12,14 @@ from app.core.errors import openai_error
 
 HTTP_BRIDGE_ACCOUNT_NEUTRAL_REPLAY_KIND = "internal_unanchored_parallel"
 HTTP_BRIDGE_ACCOUNT_NEUTRAL_REPLAY_KEY_PREFIX = "account-neutral-replay:v1:"
-# These are canonical lanes whose exact aliases may move only after the
+# These are canonical lanes and ordinary model forks whose exact aliases may move only after the
 # existing full-resend validator has proved the request account-neutral. A
 # thread lane is hard during ordinary use, just like a session-header lane;
 # omitting it here would accidentally remove safe owner-unavailable recovery
-# merely because Codex now supplies a more precise canonical identity.
+# merely because Codex now supplies a more precise canonical identity. The
+# repository separately protects live server-namespaced recovery forks.
 HTTP_BRIDGE_ACCOUNT_NEUTRAL_REPLAY_REBINDABLE_KINDS = frozenset(
-    {"prompt_cache", "session_header", "thread_header", "turn_state_header"}
+    {"prompt_cache", "session_header", "thread_header", "turn_state_header", "internal_unanchored_parallel"}
 )
 _HTTP_BRIDGE_SESSION_AFFINITY_HEADERS = frozenset(
     {

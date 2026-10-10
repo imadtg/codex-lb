@@ -131,6 +131,7 @@ class _HTTPBridgeServiceProtocol(Protocol):
         input_item_count: int | None = None,
         input_full_fingerprint: str | None = None,
         pending_tool_calls: Mapping[str, str] | None = None,
+        logical_thread_key: str | None = None,
     ) -> bool: ...
     async def _unregister_http_bridge_previous_response_id(
         self,

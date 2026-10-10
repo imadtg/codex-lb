@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import replace
 
@@ -12,7 +13,11 @@ from app.modules.proxy import service as proxy_service
 from app.modules.proxy._service import observability as observability_module
 from app.modules.proxy._service.http_bridge import helpers as http_bridge_helpers
 from app.modules.proxy._service.http_bridge import streaming as http_bridge_streaming_module
-from app.modules.proxy._service.response_create import _fingerprint_input_items, _stored_context_prefix_fingerprints
+from app.modules.proxy._service.response_create import (
+    _fingerprint_input_items,
+    _input_context_prefix_fingerprints,
+    _stored_context_prefix_fingerprints,
+)
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup
 
 pytestmark = pytest.mark.unit
@@ -76,6 +81,130 @@ def _anchor_rejection(
         lookup,
         payload_looks_like_full_resend=payload_looks_like_full_resend,
     )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "portable",
+        "changed_prefix",
+        "duplicate",
+        "missing_tool",
+        "explicit_anchor",
+        "historical_developer",
+        "file_bound",
+    ],
+)
+def test_history_discovery_requires_unique_complete_context(case: str) -> None:
+    prefix: list[JsonValue] = [_STORED_ITEMS[0]]
+    if case == "historical_developer":
+        prefix.insert(0, {"type": "additional_tools", "role": "developer", "tools": []})
+        prefix.append(
+            {
+                "type": "message",
+                "id": "msg_historical",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "retained settings"}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn_prior"},
+            }
+        )
+    payload = _payload(
+        [
+            *prefix,
+            {
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "prior answer"}],
+            },
+            _FRESH_ITEM,
+        ]
+    )
+    candidate = _lookup(
+        latest_input_item_count=len(prefix),
+        latest_input_full_fingerprint=_fingerprint_input_items(prefix),
+    )
+    candidates = [candidate]
+    if case == "changed_prefix":
+        candidate = replace(candidate, latest_input_full_fingerprint="different-prefix")
+        candidates = [candidate]
+    elif case == "duplicate":
+        candidates.append(replace(candidate, session_id="other-session", account_id="other-owner"))
+    elif case == "missing_tool":
+        candidates = [replace(candidate, latest_pending_tool_calls={"call-missing": "custom_tool_call_output"})]
+    elif case == "explicit_anchor":
+        payload = payload.model_copy(update={"previous_response_id": "resp-explicit"})
+    elif case == "file_bound":
+        assert isinstance(payload.input, list)
+        payload = payload.model_copy(
+            update={
+                "input": [
+                    *payload.input[:-1],
+                    {"role": "user", "content": [{"type": "input_file", "file_id": "file-owner-bound"}]},
+                ]
+            }
+        )
+    result = http_bridge_streaming_module._unique_portable_history_source(payload, candidates)
+    if case in {"portable", "historical_developer"}:
+        assert result == candidate
+    else:
+        assert result is None
+
+
+def test_history_discovery_fingerprints_match_canonical_prefixes_without_mutation() -> None:
+    call: dict[str, JsonValue] = {
+        "type": "function_call",
+        "call_id": "call-1",
+        "name": "tool",
+        "namespace": "tools",
+        "arguments": "{}",
+    }
+    items: list[JsonValue] = [
+        _STORED_ITEMS[0],
+        call,
+        {"type": "function_call_output", "call_id": "call-1", "output": "unicode café"},
+        _FRESH_ITEM,
+    ]
+    normalized = [items[0], {key: value for key, value in call.items() if key != "namespace"}, *items[2:]]
+    expected = {
+        _fingerprint_input_items(representation[:count])
+        for representation in (items, normalized)
+        for count in range(1, len(items))
+    }
+    assert set(_input_context_prefix_fingerprints(items)) == expected
+    assert call["namespace"] == "tools"
+    assert _input_context_prefix_fingerprints([]) == []
+    assert _input_context_prefix_fingerprints([_FRESH_ITEM]) == []
+
+
+@pytest.mark.parametrize("change", ["derived_cache", "client_cache", "scope", "api_key", "input", "model"])
+def test_portable_history_operation_identity_survives_restart_without_merging_requests(change: str) -> None:
+    frame: dict[str, JsonValue] = {
+        "type": "response.create",
+        "model": "gpt-6.1-sol",
+        "input": _STORED_ITEMS,
+        "prompt_cache_key": "cache-a",
+    }
+
+    def fingerprint(frame: dict[str, JsonValue], *, scope: str = "thread-a", api_key: str = "key-a") -> str:
+        return http_bridge_streaming_module._portable_history_operation_fingerprint(
+            request_text=json.dumps(frame),
+            api_key_scope=api_key,
+            client_scope=scope,
+            preserve_prompt_cache_key=change == "client_cache",
+        )
+
+    original = fingerprint(frame)
+    if change in {"derived_cache", "client_cache"}:
+        changed = fingerprint({**frame, "prompt_cache_key": "cache-b"})
+    elif change == "scope":
+        changed = fingerprint(frame, scope="thread-b")
+    elif change == "api_key":
+        changed = fingerprint(frame, api_key="key-b")
+    elif change == "input":
+        changed = fingerprint({**frame, "input": [*_STORED_ITEMS, _FRESH_ITEM]})
+    else:
+        changed = fingerprint({**frame, "model": "gpt-6-astra"})
+    assert (original == changed) == (change == "derived_cache")
 
 
 def test_matching_full_resend_has_no_anchor_rejection() -> None:

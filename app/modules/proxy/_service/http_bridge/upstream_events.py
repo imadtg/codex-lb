@@ -3454,7 +3454,19 @@ class _HTTPBridgeUpstreamEventsMixin:
             event_type=event_type,
             payload=payload,
         )
-        durable_quota_recovery = quota_attempt_rejection_reason(status_request_state, owner_pinned_quota_error) is None
+        # Turn-state continuations can omit previous_response_id. Their
+        # durable operation fence, rather than the optional response anchor,
+        # determines whether the outer bridge owns quota recovery.
+        durable_quota_recovery = (
+            quota_attempt_rejection_reason(
+                status_request_state,
+                _normalize_error_code(
+                    _websocket_event_error_code(event_type, payload),
+                    _websocket_event_error_type(event_type, payload),
+                ),
+            )
+            is None
+        )
         retry_error_message = _websocket_event_error_message(event_type, payload)
         quota_rejected_before_retry = status_request_state is not None and is_precreated_quota_rejection(
             status_request_state, retry_error_code
@@ -3465,6 +3477,7 @@ class _HTTPBridgeUpstreamEventsMixin:
         # the capacity terminal unchanged instead of staging a refused retry.
         wait_for_model_capacity_retry = bool(
             retry_error_code is not None
+            and not durable_quota_recovery
             and retry_error_code != _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
             and not is_previous_response_not_found_event
             and status_request_state is not None
@@ -3734,9 +3747,13 @@ class _HTTPBridgeUpstreamEventsMixin:
             # above; an accepted anchored follow-up with a proxy-injected
             # anchor and a retry-safe fresh body is replayed here exactly as
             # the capacity-message wait branch replays it.
-            if status_request_state is not None and (
-                status_request_state.previous_response_id is None
-                or _http_bridge_accepted_anchored_replay_candidate(status_request_state)
+            if (
+                status_request_state is not None
+                and not durable_quota_recovery
+                and (
+                    status_request_state.previous_response_id is None
+                    or _http_bridge_accepted_anchored_replay_candidate(status_request_state)
+                )
             ):
                 async with session.pending_lock:
                     if status_request_state not in session.pending_requests:
@@ -3918,6 +3935,11 @@ class _HTTPBridgeUpstreamEventsMixin:
                     matched_request_state.input_full_fingerprint if matched_request_state.input_item_count > 0 else None
                 ),
                 pending_tool_calls=_durable_pending_tool_call_manifest(matched_request_state, payload),
+                **(
+                    {"logical_thread_key": matched_request_state.logical_thread_key}
+                    if matched_request_state.logical_thread_key is not None
+                    else {}
+                ),
             )
             completion_anchor_registration_confirmed = alias_registered
             if not alias_registered and anchor_advance_supersession is not None:

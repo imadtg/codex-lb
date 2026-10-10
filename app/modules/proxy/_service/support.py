@@ -1050,6 +1050,8 @@ class _WebSocketRequestState:
     prewarm_latency_ms: int | None = None
     session_previous_gap_ms: int | None = None
     request_log_id: str | None = None
+    # Internal thread identity survives stripping upstream affinity on replay.
+    logical_thread_key: str | None = None
     archive_request_id: str | None = None
     requested_service_tier: str | None = None
     actual_service_tier: str | None = None
@@ -1104,6 +1106,9 @@ class _WebSocketRequestState:
     # Session headers provide locality, but only a previous response or
     # explicit turn-state header guarantees continuity for stale recovery.
     hard_continuity_anchor: bool = False
+    # Portable history can require execution deduplication without proving
+    # an account-owned continuity anchor.
+    operation_fence_required: bool = False
     proxy_injected_previous_response_id: bool = False
     # The durable lookup carried an anchor, but its owner was already stale,
     # ownerless, or lease-expired when this request arrived.  Such a request
@@ -1143,6 +1148,8 @@ class _WebSocketRequestState:
     # on, and dropping the anchor there would silently turn a continuation into
     # a context-free fresh turn.
     fresh_upstream_request_is_retry_safe: bool = False
+    # Verified prefix boundary before direct-WebSocket anchor injection.
+    fresh_upstream_request_stored_input_count: int | None = None
     # Memo for the account installation-id stamp applied to ``request_text`` /
     # ``fresh_upstream_request_text`` on the HTTP bridge submit path. The stamp
     # is re-applied at several submit and retry sites; these fields remember the

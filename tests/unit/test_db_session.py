@@ -18,7 +18,7 @@ from sqlalchemy import event as sa_event
 from sqlalchemy import text as sa_text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
 
 import app.db.session as session_module
 from app.db.models import Account, AccountStatus, Base
@@ -105,46 +105,27 @@ def test_import_session_with_postgres_url_does_not_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sqlite_writer_section_serializes_file_sqlite_writers(monkeypatch, tmp_path) -> None:
+async def test_legacy_writer_section_has_no_second_lock_order(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         session_module,
         "_settings",
         _FakeSettings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'store.db'}"),
     )
-    monkeypatch.setattr(session_module, "_sqlite_writer_lock", None)
-    first_entered = asyncio.Event()
-    release_first = asyncio.Event()
-    order: list[str] = []
-
-    async def first_writer() -> None:
+    # Actual transaction serialization is exercised by the real SQLite
+    # integration tests; the legacy scope must allow re-entry in either order.
+    async with session_module.sqlite_writer_section():
         async with session_module.sqlite_writer_section():
-            order.append("first-start")
-            first_entered.set()
-            await release_first.wait()
-            order.append("first-end")
+            await asyncio.wait_for(_enter_legacy_writer_section(), timeout=1)
 
-    async def second_writer() -> None:
-        async with session_module.sqlite_writer_section():
-            order.append("second-start")
-            order.append("second-end")
 
-    first_task = asyncio.create_task(first_writer())
-    await first_entered.wait()
-    second_task = asyncio.create_task(second_writer())
-    await asyncio.sleep(0)
-
-    assert order == ["first-start"]
-
-    release_first.set()
-    await asyncio.gather(first_task, second_task)
-
-    assert order == ["first-start", "first-end", "second-start", "second-end"]
+async def _enter_legacy_writer_section() -> None:
+    async with session_module.sqlite_writer_section():
+        pass
 
 
 @pytest.mark.asyncio
 async def test_sqlite_writer_section_does_not_serialize_memory_sqlite(monkeypatch) -> None:
     monkeypatch.setattr(session_module, "_settings", _FakeSettings(database_url="sqlite+aiosqlite:///:memory:"))
-    monkeypatch.setattr(session_module, "_sqlite_writer_lock", None)
     first_entered = asyncio.Event()
     second_entered = asyncio.Event()
 
@@ -288,7 +269,7 @@ def test_postgres_engine_kwargs_use_nullpool_under_test_db_url(monkeypatch) -> N
     assert "pool_recycle" not in kwargs
 
 
-def test_sqlite_file_engine_kwargs_use_nullpool_without_pool_controls(monkeypatch) -> None:
+def test_sqlite_file_engine_kwargs_retain_bounded_pool(monkeypatch) -> None:
     monkeypatch.setattr(
         session_module,
         "_settings",
@@ -301,11 +282,11 @@ def test_sqlite_file_engine_kwargs_use_nullpool_without_pool_controls(monkeypatc
 
     kwargs = session_module._sqlite_file_async_engine_kwargs()
 
-    assert kwargs["poolclass"] is NullPool
+    assert kwargs["poolclass"] is AsyncAdaptedQueuePool
     assert kwargs["connect_args"] == {"timeout": 30.0}
-    assert "pool_size" not in kwargs
-    assert "max_overflow" not in kwargs
-    assert "pool_timeout" not in kwargs
+    assert kwargs["pool_size"] == 4
+    assert kwargs["max_overflow"] == 0
+    assert kwargs["pool_timeout"] == 30.0
 
 
 def test_postgres_engine_kwargs_keep_pool_controls(monkeypatch) -> None:

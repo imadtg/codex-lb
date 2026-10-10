@@ -1,7 +1,9 @@
 """Black-box continuity regression: separate codex-lb process, public APIs only.
 
 Run with the harness environment's Python and --checkout pointing at either build.
-No application/test imports, monkeypatches, SQL writes, or production credentials.
+No application/test imports, monkeypatches, or production credentials.
+The optional writer-contention mode writes a disposable sentinel row.
+The cancelled-driver mode installs test-only control routes in the disposable child.
 Synthetic text replaces private content; developer item structure comes from a
 compacted Codex rollout. This is a wire replay, not yet a real-client compaction E2E.
 """
@@ -15,8 +17,10 @@ import hashlib
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -88,8 +92,67 @@ def expected_replay_input(items):
     ]
 
 
-async def run(checkout, variant, artifact):
+async def run(
+    checkout,
+    variant,
+    artifact,
+    initial_checkout=None,
+    return_checkout=None,
+    writer_contention=False,
+    cancelled_driver_pressure=False,
+):
     calls = []
+    writer_tasks = []
+    probe_database = None
+
+    def hold_writer(path, entered):
+        connection = sqlite3.connect(path, timeout=5)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT OR REPLACE INTO runtime_sentinels (name, value) VALUES ('probe_write_pressure', '1')"
+            )
+            entered.set()
+            time.sleep(1.4)
+            connection.commit()
+            # Independent repeated writes exercise contention with real local
+            # schedulers, lease/heartbeat and request persistence in the child.
+            for _ in range(8):
+                connection.execute(
+                    "UPDATE runtime_sentinels SET value = CAST(value AS INTEGER) + 1 "
+                    "WHERE name = 'probe_write_pressure'"
+                )
+                connection.commit()
+                time.sleep(0.05)
+        finally:
+            entered.set()
+            connection.close()
+
+    def check_writer(path):
+        connection = sqlite3.connect(path, timeout=1, isolation_level=None)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("ROLLBACK")
+            return int(
+                connection.execute(
+                    "SELECT value FROM runtime_sentinels WHERE name = 'probe_write_pressure'"
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+
+    developer_block = variant == "model_switch_developer_block"
+    compact_model = (
+        variant
+        in {
+            "model_compaction_retry",
+            "quota_bridge_model_compaction_turn_state",
+            "model_compaction_build_swap",
+        }
+        or variant == "model_compaction_build_swap_ambiguous"
+    )
+    ambiguous_history_recovery = variant == "model_compaction_build_swap_ambiguous"
+    quota_armed = not compact_model
     response_turn_states: list[str | None] = []
     fresh_prewarm = variant == "fresh_prewarm_capacity_refusal"
     replacement_exhausted = variant.startswith("quota_bridge_replacement_")
@@ -140,18 +203,22 @@ async def run(checkout, variant, artifact):
         "id": "msg_answer",
         "role": "assistant",
         "status": "completed",
-        "content": [{"type": "output_text", "text": "RECOVERED", "annotations": []}],
+        "content": [{"type": "output_text", "text": "RECOVERED"}],
     }
 
     def response_events():
-        item = tool if len(calls) == 1 else {**answer, "id": f"msg_answer_{len(calls)}"}
+        item = (
+            tool
+            if len(calls) == 1 and not developer_block
+            else {**answer, "id": f"msg_answer_{len(calls)}", "phase": "final_answer"}
+        )
         rid = "resp_owner" if len(calls) == 1 else f"resp_alternate_{len(calls)}"
         if fresh_prewarm and len(calls) == 1:
             return [
                 {"type": "response.created", "response": {"id": rid, "status": "in_progress"}},
                 {"type": "response.completed", "response": {"id": rid, "status": "completed", "output": []}},
             ]
-        events = [
+        events: list[dict[str, Any]] = [
             {"type": "response.created", "response": {"id": rid, "status": "in_progress"}},
         ]
         if commentary_tool and len(calls) == 1:
@@ -196,6 +263,30 @@ async def run(checkout, variant, artifact):
                     "body": json.loads(message.data),
                 }
             )
+            if ambiguous_history_recovery and account == "synthetic-alternate" and len(calls) == 3:
+                await ws.send_json(
+                    {"type": "response.created", "response": {"id": "resp_unknown", "status": "in_progress"}}
+                )
+                await ws.send_json(
+                    {
+                        "type": "response.output_item.added",
+                        "response_id": "resp_unknown",
+                        "output_index": 0,
+                        "item": {"type": "message", "id": "msg_partial", "role": "assistant", "content": []},
+                    }
+                )
+                await ws.send_json(
+                    {
+                        "type": "response.output_text.delta",
+                        "response_id": "resp_unknown",
+                        "item_id": "msg_partial",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": "Partial output before transport failure",
+                    }
+                )
+                await ws.close(code=1011)
+                break
             if fresh_prewarm and account == "synthetic-owner" and len(calls) > 1:
                 for sequence, event in enumerate(
                     [
@@ -213,6 +304,7 @@ async def run(checkout, variant, artifact):
             if (
                 bridge_quota
                 and not healthy
+                and quota_armed
                 and ((account == "synthetic-owner" and len(calls) > 1) or account in exhausted_accounts)
             ):
                 error = {
@@ -225,6 +317,10 @@ async def run(checkout, variant, artifact):
                     and account == "synthetic-owner"
                     and calls[-1]["body"].get("previous_response_id")
                 ):
+                    # A missing response does not exhaust this account. Pause
+                    # it through the public API so replacement controls do not
+                    # depend on random selection of an otherwise eligible owner.
+                    await api("POST", f"/api/accounts/{owner}/pause")
                     error = {
                         "code": "previous_response_not_found",
                         "type": "invalid_request_error",
@@ -282,8 +378,20 @@ async def run(checkout, variant, artifact):
                 )
                 continue
             for sequence, event in enumerate(response_events()):
+                if cancelled_driver_pressure and event["type"] == "response.completed":
+                    async with ClientSession() as control:
+                        async with control.post(f"http://127.0.0.1:{port}/__probe/cancel-driver") as result:
+                            pressure = await result.json()
+                            assert result.status == 200 and pressure["cancellation_deferred"], pressure
+                            report.setdefault("driver_pressure", []).append(pressure)
+                if writer_contention and event["type"] == "response.completed":
+                    entered = threading.Event()
+                    writer_tasks.append(asyncio.create_task(asyncio.to_thread(hold_writer, probe_database, entered)))
+                    assert await asyncio.to_thread(entered.wait, 5), "writer pressure did not start"
                 await ws.send_json({**event, "sequence_number": sequence})
-            if "reconnect" in variant and account == "synthetic-alternate":
+            if ("reconnect" in variant and account == "synthetic-alternate") or (
+                variant == "model_compaction_retry" and len(calls) == 2
+            ):
                 await ws.close()
         return ws
 
@@ -320,26 +428,38 @@ async def run(checkout, variant, artifact):
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
     artifact.mkdir(parents=True, exist_ok=True)
+    if (checkout / ".git").exists():
+        source_identity = {
+            "checkout_commit": subprocess.check_output(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
+            ).strip(),
+            "checkout_dirty": bool(
+                subprocess.check_output(["git", "-C", str(checkout), "status", "--porcelain"], text=True).strip()
+            ),
+            "application_diff_sha256": hashlib.sha256(
+                subprocess.check_output(
+                    ["git", "-C", str(checkout), "diff", "HEAD", "--", "app", "pyproject.toml", "uv.lock"]
+                )
+            ).hexdigest(),
+        }
+    else:
+        provenance = json.loads((checkout.parent / f"{checkout.name}-provenance.json").read_text())
+        source_identity = {
+            "checkout_commit": provenance["commit"],
+            "checkout_dirty": False,
+            "checkout_archive_sha256": provenance["archive_sha256"],
+        }
     report: dict[str, Any] = {
         "variant": variant,
         "checkout": str(checkout),
         "calls": calls,
         "response_turn_states": response_turn_states,
-        "checkout_commit": subprocess.check_output(
-            ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
-        ).strip(),
-        "checkout_dirty": bool(
-            subprocess.check_output(["git", "-C", str(checkout), "status", "--porcelain"], text=True).strip()
-        ),
+        **source_identity,
         "phase": "setup",
         "probe_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "application_diff_sha256": hashlib.sha256(
-            subprocess.check_output(
-                ["git", "-C", str(checkout), "diff", "HEAD", "--", "app", "pyproject.toml", "uv.lock"]
-            )
-        ).hexdigest(),
     }
     with tempfile.TemporaryDirectory(prefix="lb-blackbox-") as directory:
+        probe_database = Path(directory) / "store.db"
         env = {
             k: v
             for k, v in os.environ.items()
@@ -351,6 +471,8 @@ async def run(checkout, variant, artifact):
             CODEX_LB_DATA_DIR=directory,
             CODEX_LB_DATABASE_URL=f"sqlite+aiosqlite:///{directory}/store.db",
             CODEX_LB_UPSTREAM_BASE_URL=f"http://127.0.0.1:{upstream_port}/backend-api",
+            PYTHONPATH=str(initial_checkout or checkout)
+            + (":" + str(checkout / "tests/fixtures") if cancelled_driver_pressure else ""),
         )
         for setting in (
             "USAGE_REFRESH",
@@ -366,7 +488,12 @@ async def run(checkout, variant, artifact):
         with (artifact / "server.log").open("w") as log:
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    str(checkout / ".venv/bin/codex-lb"),
+                    str((initial_checkout or checkout) / ".venv/bin/python"),
+                    *(
+                        ["-c", "import runpy,sqlite_driver_pressure; runpy.run_module('app.cli',run_name='__main__')"]
+                        if cancelled_driver_pressure
+                        else ["-m", "app.cli"]
+                    ),
                     "--host",
                     "127.0.0.1",
                     "--port",
@@ -390,6 +517,39 @@ async def run(checkout, variant, artifact):
                         await asyncio.sleep(0.2)
                     else:
                         raise RuntimeError("server startup timed out")
+
+                    async def restart(build):
+                        nonlocal proc
+                        assert proc is not None
+                        proc.terminate()
+                        try:
+                            await asyncio.wait_for(proc.wait(), 10)
+                        except TimeoutError:
+                            proc.kill()
+                            await proc.wait()
+                        proc = await asyncio.create_subprocess_exec(
+                            str(checkout / ".venv/bin/codex-lb"),
+                            "--host",
+                            "127.0.0.1",
+                            "--port",
+                            str(port),
+                            cwd=directory,
+                            env={**env, "PYTHONPATH": str(build)},
+                            stdout=log,
+                            stderr=log,
+                        )
+                        for _ in range(450):
+                            try:
+                                async with client.get(base + "/health") as response:
+                                    if response.status == 200:
+                                        report.setdefault("build_swaps", []).append(str(build))
+                                        return
+                            except OSError:
+                                pass
+                            if proc.returncode is not None:
+                                raise RuntimeError("replacement server exited; see server.log")
+                            await asyncio.sleep(0.2)
+                        raise RuntimeError("replacement server startup timed out")
 
                     async def api(method, path, **kwargs):
                         async with client.request(method, base + path, **kwargs) as response:
@@ -487,7 +647,7 @@ async def run(checkout, variant, artifact):
                                 ],
                             }
                         ]
-                    headers = {"session_id": "synthetic-process", "thread-id": "synthetic-thread"}
+                    headers: dict[str, str] = {"session_id": "synthetic-process", "thread-id": "synthetic-thread"}
                     if agent_message_history:
                         prefix.append(
                             {
@@ -508,6 +668,9 @@ async def run(checkout, variant, artifact):
                             agent_content.append(
                                 {"type": "encrypted_content", "encrypted_content": "synthetic-opaque-content"}
                             )
+
+                    if compact_model:
+                        prefix.extend({"role": "user", "content": f"Earlier task {i}"} for i in range(20))
 
                     downstream_ws = None
 
@@ -543,15 +706,33 @@ async def run(checkout, variant, artifact):
 
                     initial_response = completed_response(report["first"][1])
                     assert initial_response is not None and initial_response["id"] == "resp_owner", report["first"]
-                    if not fresh_prewarm:
+                    if not fresh_prewarm and not developer_block:
                         # Replay the tool actually delivered through the public API.
                         delivered = next(item for item in initial_response["output"] if item.get("call_id"))
                         assert delivered["call_id"] == result["call_id"]
                         tool = delivered
+                    if compact_model:
+                        compacted: list[dict[str, Any]] = [
+                            *prefix[:2],
+                            {"role": "user", "content": "Compacted task summary"},
+                        ]
+                        body["model"] = "gpt-6.1-sol"
+                        report["model_transition"] = await send(compacted)
+                        context_response = completed_response(report["model_transition"][1])
+                        assert context_response is not None, report["model_transition"]
+                        prefix = compacted
+                        tool = context_response["output"][0]
+                        quota_armed = True
+                        if echo_turn_state:
+                            model_turn_state = response_turn_states[-1]
+                            assert model_turn_state, "The model transition must establish a token"
+                            headers["x-codex-turn-state"] = model_turn_state
+                        if initial_checkout is not None:
+                            await restart(checkout)
                     report["phase"] = "scenario"
                     if bridge_quota:
-                        assert len(calls) == 1 and calls[0]["transport"] == "websocket", calls
-                    if echo_turn_state:
+                        assert len(calls) == (2 if compact_model else 1) and calls[0]["transport"] == "websocket", calls
+                    if echo_turn_state and not compact_model:
                         first_turn_state = response_turn_states[0]
                         assert first_turn_state, "The server must establish the token; never fabricate client state"
                         headers["x-codex-turn-state"] = first_turn_state
@@ -561,6 +742,26 @@ async def run(checkout, variant, artifact):
                     if not direct_quota and not bridge_quota and not fresh_prewarm:
                         await api("POST", f"/api/accounts/{owner}/pause")
                     full: list[dict[str, Any]] = [*prefix, tool, result, {"role": "user", "content": "Continue"}]
+                    if developer_block or compact_model:
+                        if developer_block:
+                            tool = initial_response["output"][0]
+                            body["model"] = "gpt-6.1-sol"
+                        full = [*prefix, tool]
+                        if developer_block:
+                            full.extend(
+                                {
+                                    "type": "message",
+                                    "role": "developer",
+                                    "content": [{"type": "input_text", "text": f"<{kind}>Synthetic control</{kind}>"}],
+                                }
+                                for kind in (
+                                    "model_switch",
+                                    "collaboration_mode",
+                                    "t3_code_orchestration",
+                                    "t3_code_runtime",
+                                )
+                            )
+                        full.append({"role": "user", "content": "Continue"})
                     if commentary_tool:
                         full.insert(len(prefix), commentary)
                     if fresh_prewarm:
@@ -589,9 +790,43 @@ async def run(checkout, variant, artifact):
                     # anchor (client.rs prepare_websocket_request). A rollout's
                     # logical full request is not evidence of the wire payload.
                     report["second"] = await send(full[-1:] if fresh_prewarm else full)
+                    if ambiguous_history_recovery:
+                        assert terminal_error_code(report["second"][1]) == "stream_incomplete", report["second"]
+                        assert [call["account"] for call in calls] == [
+                            "synthetic-owner",
+                            "synthetic-owner",
+                            "synthetic-alternate",
+                        ], calls
+                        await restart(checkout)
+                        prior_calls = len(calls)
+                        report["retry"] = await send(full)
+                        assert (report["retry"][0], terminal_error_code(report["retry"][1])) in {
+                            (200, "stream_incomplete"),
+                            (502, "bridge_continuity_persistence_failed"),
+                            (503, "upstream_operation_status_unknown"),
+                        }, report["retry"]
+                        assert len(calls) == prior_calls, "Ambiguous recovery was dispatched twice"
+                        report["passed"] = True
+                        return True
                     if healthy:
                         assert recovered_response(report["second"][1]), report["second"]
                         assert [call["account"] for call in calls] == ["synthetic-owner", "synthetic-owner"], calls
+                        if return_checkout is not None:
+                            latest_token = response_turn_states[-1]
+                            if latest_token:
+                                headers["x-codex-turn-state"] = latest_token
+                            else:
+                                headers.pop("x-codex-turn-state", None)
+                            body["previous_response_id"] = "resp_alternate_2"
+                            await restart(return_checkout)
+                            full = [
+                                *full,
+                                {**answer, "id": "msg_answer_2"},
+                                {"role": "user", "content": "Continue after returning to the fork"},
+                            ]
+                            report["third"] = await send(full)
+                            assert recovered_response(report["third"][1]), report["third"]
+                            assert [call["account"] for call in calls] == ["synthetic-owner"] * 3
                         report["passed"] = True
                         return True
                     if replacement_exhausted:
@@ -635,7 +870,12 @@ async def run(checkout, variant, artifact):
                         assert calls[-1]["body"]["input"] == expected_replay_input(full), calls[-1]
                         if namespaced_tool:
                             assert calls[-1]["body"]["tools"] == calls[0]["body"]["tools"], calls[-1]
-                        if bridge_quota:
+                        if bridge_quota or developer_block or compact_model:
+                            if return_checkout is not None:
+                                recovered_token = response_turn_states[-1]
+                                assert recovered_token, "Recovery must return its ordinary continuity token"
+                                headers["x-codex-turn-state"] = recovered_token
+                                await restart(return_checkout)
                             prior_call_count = len(calls)
                             followup_answer = {
                                 **answer,
@@ -739,13 +979,37 @@ async def run(checkout, variant, artifact):
                     report["passed"] = report["recovered"] == (
                         not unsafe_history
                         and not accepted_failure
-                        and (variant in {"control", "historical"} or direct_quota or bridge_quota or fresh_prewarm)
+                        and (
+                            variant in {"control", "historical"}
+                            or developer_block
+                            or compact_model
+                            or direct_quota
+                            or bridge_quota
+                            or fresh_prewarm
+                        )
                     )
+                if cancelled_driver_pressure:
+                    async with ClientSession() as control:
+                        async with control.post(base + "/__probe/driver-result") as result:
+                            recovery = await result.json()
+                            assert result.status == 200 and all(recovery.values()), recovery
+                            report["driver_recovery"] = recovery
+                        async with control.get(base + "/health/ready") as result:
+                            assert result.status == 200
+                if writer_contention:
+                    await asyncio.gather(*writer_tasks)
+                    report["background_write_count"] = await asyncio.to_thread(check_writer, probe_database)
+                    report["writer_slot_released"] = True
+                    async with ClientSession() as probe_client:
+                        async with probe_client.get(base + "/health/ready") as probe_response:
+                            report["readiness_after_pressure"] = probe_response.status
+                    assert report["readiness_after_pressure"] == 200
             except Exception as exc:
                 report["passed"] = False
                 report["failure"] = {"phase": report["phase"], "type": type(exc).__name__, "message": str(exc)}
                 raise
             finally:
+                await asyncio.gather(*writer_tasks, return_exceptions=True)
                 if proc is not None and proc.returncode is None:
                     proc.terminate()
                     try:
@@ -767,9 +1031,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkout", type=Path, required=True)
     parser.add_argument("--artifact", type=Path, required=True)
+    parser.add_argument("--initial-checkout", type=Path)
+    parser.add_argument("--return-checkout", type=Path)
+    parser.add_argument("--writer-contention", action="store_true")
+    parser.add_argument("--cancelled-driver-pressure", action="store_true")
     parser.add_argument(
         "--variant",
         choices=[
+            "model_switch_developer_block",
+            "model_compaction_retry",
+            "model_compaction_build_swap",
+            "model_compaction_build_swap_ambiguous",
+            "quota_bridge_model_compaction_turn_state",
             "quota_bridge_namespace_plain_prefix",
             "quota_bridge_commentary_tool",
             "quota_bridge_commentary_tool_missing_output",
@@ -808,4 +1081,18 @@ if __name__ == "__main__":
         default="historical",
     )
     args = parser.parse_args()
-    raise SystemExit(0 if asyncio.run(run(args.checkout.resolve(), args.variant, args.artifact.resolve())) else 1)
+    raise SystemExit(
+        0
+        if asyncio.run(
+            run(
+                args.checkout.resolve(),
+                args.variant,
+                args.artifact.resolve(),
+                args.initial_checkout.resolve() if args.initial_checkout else None,
+                args.return_checkout.resolve() if args.return_checkout else None,
+                args.writer_contention,
+                args.cancelled_driver_pressure,
+            )
+        )
+        else 1
+    )

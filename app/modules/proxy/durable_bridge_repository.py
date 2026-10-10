@@ -1015,6 +1015,37 @@ class DurableBridgeRepository:
         row = result.scalar_one_or_none()
         return _to_snapshot(row)
 
+    async def list_completed_history_candidates(
+        self,
+        *,
+        api_key_scope: str,
+        input_item_count: int,
+        prefix_fingerprints: Sequence[str],
+    ) -> list[DurableBridgeSessionSnapshot]:
+        # This is context evidence, not a thread/account identity lookup.
+        # Filter before fetching: unrelated branches must not hide a proof.
+        # Chunk parameters for SQLite while preserving every matching row.
+        snapshots: dict[str, DurableBridgeSessionSnapshot] = {}
+        for offset in range(0, len(prefix_fingerprints), 200):
+            rows = await self._session.scalars(
+                select(HttpBridgeSessionRecord).where(
+                    HttpBridgeSessionRecord.api_key_scope == api_key_scope,
+                    HttpBridgeSessionRecord.session_key_kind.in_(
+                        ("internal_unanchored_parallel", "internal_model_parallel")
+                    ),
+                    HttpBridgeSessionRecord.latest_response_id.is_not(None),
+                    HttpBridgeSessionRecord.latest_input_full_fingerprint.in_(
+                        prefix_fingerprints[offset : offset + 200]
+                    ),
+                    HttpBridgeSessionRecord.latest_input_item_count > 0,
+                    HttpBridgeSessionRecord.latest_input_item_count < input_item_count,
+                )
+            )
+            for row in rows:
+                if (snapshot := _to_snapshot(row)) is not None:
+                    snapshots[snapshot.id] = snapshot
+        return list(snapshots.values())
+
     async def find_session_by_latest_turn_state(
         self,
         *,
@@ -3978,6 +4009,7 @@ class DurableBridgeRepository:
         latest_input_item_count: int | None = None,
         latest_input_full_fingerprint: str | None = None,
         latest_pending_tool_calls: Mapping[str, str] | None = None,
+        logical_thread_key: str | None = None,
     ) -> DurableBridgeAliasRegistration:
         """Register continuity only while the caller still owns the durable row."""
 
@@ -4033,6 +4065,16 @@ class DurableBridgeRepository:
             if not registered:
                 await self._session.rollback()
                 return DurableBridgeAliasRegistration.ALIAS_PROTECTED
+            if logical_thread_key is not None and latest_response_id is not None:
+                # Publish the latest completed generation atomically with its
+                # response/context proof. This is a routing hint, not ownership
+                # of an earlier response, so it can advance across live forks.
+                await self._execute_alias_upsert(
+                    session_id=session_id,
+                    alias_kind="logical_thread",
+                    alias_value=logical_thread_key,
+                    api_key_scope=api_key_scope,
+                )
             await self._session.commit()
         return DurableBridgeAliasRegistration.REGISTERED
 
@@ -4297,10 +4339,16 @@ class DurableBridgeRepository:
                 HttpBridgeSessionRecord.session_key_value != HTTP_BRIDGE_ACCOUNT_NEUTRAL_REPLAY_KEY_PREFIX,
             )
         )
-        existing_target_is_rebindable = HttpBridgeSessionAlias.session_id.in_(
-            select(HttpBridgeSessionRecord.id).where(
-                HttpBridgeSessionRecord.session_key_kind.in_(HTTP_BRIDGE_ACCOUNT_NEUTRAL_REPLAY_REBINDABLE_KINDS),
-            )
+        # Ordinary model-transition forks can yield their aliases after a
+        # proven full resend. Live recovery forks still serialize replacement
+        # attempts, even though they share the same internal key kind.
+        existing_target_is_rebindable = and_(
+            HttpBridgeSessionAlias.session_id.in_(
+                select(HttpBridgeSessionRecord.id).where(
+                    HttpBridgeSessionRecord.session_key_kind.in_(HTTP_BRIDGE_ACCOUNT_NEUTRAL_REPLAY_REBINDABLE_KINDS),
+                )
+            ),
+            ~existing_target_is_account_neutral_replay,
         )
         existing_target_is_replaceable_recovery = HttpBridgeSessionAlias.session_id.in_(
             select(HttpBridgeSessionRecord.id).where(

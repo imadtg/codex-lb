@@ -159,6 +159,23 @@ def _fingerprint_input_items(items: Sequence[JsonValue]) -> str:
     return sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _input_context_prefix_fingerprints(items: list[JsonValue]) -> list[str]:
+    """Hash each proper prefix in linear time, including forwarding normalization."""
+    normalized: dict[str, JsonValue] = {"input": items}
+    strip_replayed_tool_call_namespaces_from_payload(normalized)
+    fingerprints: dict[str, None] = {}
+    for representation in (items, normalized["input"]):
+        digest = sha256(b"[")
+        for index, item in enumerate(representation[:-1]):
+            if index:
+                digest.update(b",")
+            digest.update(json.dumps(item, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+            prefix_digest = digest.copy()
+            prefix_digest.update(b"]")
+            fingerprints[prefix_digest.hexdigest()] = None
+    return list(fingerprints)
+
+
 def _stored_context_prefix_fingerprints(input_value: JsonValue, *, stored_count: int) -> tuple[str | None, str | None]:
     """Bounded identifiers for raw and forwarding-normalized prefix diagnostics.
 

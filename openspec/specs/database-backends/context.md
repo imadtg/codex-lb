@@ -45,3 +45,14 @@ For example, a native rollback may finish while the loop is blocked across the i
 Warnings distinguish observed completion, attempted reclamation and failed cleanup. Elapsed time at the initial bound is not an event-loop lag measurement, and a failed invalidation does not prove a permanent writer hold. No database migration, pool change or operator setting is required. The [owning requirement](spec.md#requirement-a-completed-sqlite-teardown-is-never-reclaimed) defines the completion and cleanup contract.
 
 The invalidation warning covers exceptions raised by `connection.invalidate()`. SQLAlchemy 2.0.52 catches ordinary driver-close exceptions inside `Pool._close_connection` and logs them at ERROR, so those failures retain the pool's diagnostic owner. Finalization can also run for a task already terminal during grace; its message reports completion without claiming that the task finished after reclamation.
+
+
+## SQLite operation ownership (October 2026 fork)
+
+File-SQLite sessions retain ownership of dispatched driver work through result collection and cleanup. Cancellation is observed after that work finishes, so an unfinished RETURNING cursor cannot be abandoned on a Python-closed native connection. Admission is shared by resolved database path across main and background engines. Existing writer scopes acquire admission at their first statement, including reads that guard a mutation; ordinary readers outside those scopes remain concurrent. The scope context contains a boolean, so a child task does not inherit a connection's admission lease.
+
+Four retained connections per engine with zero overflow remove last-close checkpoint work from ordinary session teardown. WAL/NORMAL and automatic checkpoint settings remain unchanged. Commit checkpoints, long readers and host storage stalls remain possible; writer readiness continues to check actual acquisition after sustained degradation.
+
+For example, cancelling a lease UPDATE while the worker is paused leaves the driver owner running. Once the worker returns, its result is collected and rollback/close finish before the caller receives cancellation. A concurrent renewal observer shares one owner, and a generation fence prevents a late result from restoring demoted local leadership. Shutdown reports unclean if its bounded drain cannot finish rather than closing a connection concurrently with its worker.
+
+This repair does not change schema or persisted continuity representations; the same database remains interchangeable with official beta.8. Verification details are retained in `openspec/changes/archive/2026-10-10-repair-sqlite-operation-ownership/verification.md`.

@@ -14,7 +14,8 @@ from app.core.config.settings import get_settings
 from app.core.shutdown import DRAIN_DEADLINE_HEADER
 from app.core.utils.time import utcnow
 from app.db.models import BridgeRingMember
-from app.db.session import get_session
+from app.db.session import engine, get_session
+from app.db.sqlite_writer_health import sqlite_writer_is_ready
 from app.modules.health.schemas import BridgeRingInfo, HealthCheckResponse, HealthResponse
 from app.modules.proxy.ring_membership import RING_STALE_THRESHOLD_SECONDS
 
@@ -55,6 +56,9 @@ async def health_ready() -> HealthCheckResponse:
 
     if draining:
         raise HTTPException(status_code=503, detail="Service is draining")
+
+    if not await sqlite_writer_is_ready(str(engine.url)):
+        raise HTTPException(status_code=503, detail="Service SQLite writer slot is unavailable")
 
     try:
         async for session in get_session():

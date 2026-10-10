@@ -778,8 +778,14 @@ async def lifespan(app: FastAPI):
                 await svc.heartbeat(iid, endpoint_base_url=bridge_endpoint_base_url)
             except Exception:
                 logger.warning("Ring heartbeat failed", exc_info=True)
-            await run_http_bridge_heartbeat_maintenance(getattr(app.state, "proxy_service", None))
-            await refresh_cap_partition(svc.list_active, iid)
+            try:
+                await run_http_bridge_heartbeat_maintenance(getattr(app.state, "proxy_service", None))
+            except Exception:
+                logger.warning("Bridge heartbeat maintenance failed", exc_info=True)
+            try:
+                await refresh_cap_partition(svc.list_active, iid)
+            except Exception:
+                logger.warning("Bridge capacity refresh failed", exc_info=True)
 
     async def _register_and_heartbeat(svc: RingMembershipService, iid: str) -> None:
         attempt = 0

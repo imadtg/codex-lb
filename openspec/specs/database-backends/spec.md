@@ -3,7 +3,9 @@
 ## Purpose
 
 Define supported database backend wiring so local, Helm, SQLite, and external PostgreSQL deployments behave consistently.
+
 ## Requirements
+
 ### Requirement: Helm external PostgreSQL wiring resolves a non-empty database URL
 
 When the Helm chart deploys with `postgresql.enabled=false`, it MUST provide a non-empty `CODEX_LB_DATABASE_URL` to the workload from one of the supported external database inputs. The chart MUST accept a direct `externalDatabase.url`, and it MUST also support reading `database-url` from an operator-provided external database secret reference without requiring the application encryption-key secret to be the same object.
@@ -165,52 +167,20 @@ installations SHALL default the value to `secondary`.
 - **WHEN** a settings update requests a reset-window value other than `primary` or `secondary`
 - **THEN** the API rejects the payload instead of persisting it
 
-### Requirement: File-backed SQLite engines do not retain idle pooled descriptors
-
-File-backed SQLite main and background async engines MUST use non-pooled connection semantics.
-
-SQLite `:memory:` databases MUST preserve the existing shared-engine behavior
-for background sessions so schema state remains visible to background tasks.
-
-Pool sizing (`database_pool_size`, `database_max_overflow`) and the fixed
-pool checkout timeout SHALL constrain pooled backends only. They SHALL NOT
-be passed to file-backed SQLite engines.
-
-#### Scenario: File SQLite uses NullPool
-
-- **GIVEN** `database_url` resolves to a file-backed SQLite database
-- **WHEN** the application creates its main or background async engine
-- **THEN** the engine is configured with `NullPool`
-- **AND** `pool_size`, `max_overflow`, and `pool_timeout` are not passed
-- **AND** existing SQLite PRAGMAs and busy timeout behavior remain enabled
-
-#### Scenario: PostgreSQL pooling is unchanged
-
-- **GIVEN** `database_url` resolves to PostgreSQL
-- **WHEN** the application creates its main or background async engine
-- **THEN** PostgreSQL pool sizing, overflow, pre-ping, and recycle controls remain configured as before
-
 ### Requirement: SQLite account writes share the local writer section
+SQLite account mutation paths SHALL use shared engine transaction admission before performing database writes, including account import/upsert, reauthentication, token persistence, status transitions, dashboard preferences and deletion. Legacy writer section scopes SHALL remain callable without adding a second mutex. PostgreSQL transaction and advisory-lock behavior SHALL remain unchanged.
 
-SQLite account mutation paths SHALL enter the shared SQLite writer section
-before performing database writes. This includes account import/upsert,
-reauthentication upsert, token refresh persistence, status transitions,
-account-level dashboard preference writes, and account deletion.
-
-PostgreSQL account mutation paths SHALL preserve their existing transaction and
-advisory-lock behavior.
+#### Scenario: Account persistence shares admission with coordination writes
+- **WHEN** an account mutation uses an application file-SQLite session
+- **THEN** engine admission serializes its transaction with background coordination writes
 
 #### Scenario: Account token persistence is serialized on SQLite
-
-- **GIVEN** the deployment uses a file-backed SQLite database
-- **WHEN** an account token refresh persists new encrypted token values
-- **THEN** the write executes inside the shared SQLite writer section
+- **WHEN** a token refresh persists encrypted token values through an application file-SQLite session
+- **THEN** engine transaction admission serializes its write
 
 #### Scenario: Account status persistence is serialized on SQLite
-
-- **GIVEN** the deployment uses a file-backed SQLite database
-- **WHEN** an account status transition is persisted
-- **THEN** the write executes inside the shared SQLite writer section
+- **WHEN** an account status transition is persisted through an application file-SQLite session
+- **THEN** engine transaction admission serializes its write
 
 ### Requirement: Telemetry write transactions relax commit durability on PostgreSQL
 
@@ -922,3 +892,51 @@ The startup writes that insert-if-absent into `runtime_sentinels` — the encryp
 - **THEN** the report names the write, the driver's `sqlite_errorname` (or its absence), and the elapsed time
 - **AND** the report contains none of the values the write was stamping
 
+### Requirement: Sustained SQLite write failure is visible to readiness
+
+After repeated file-backed SQLite busy failures over at least the configured busy timeout, the system SHALL check writer-slot acquisition on a fresh connection with a bounded wait. A failed acquisition SHALL emit a rate-limited sqlite_writer_slot_held diagnostic and cause infrastructure readiness to return 503. Successful acquisition SHALL roll back, close the probe connection, and clear the writer degradation. Healthy operation SHALL NOT perform these probes. Probe tasks SHALL have explicit ownership; concurrent readiness requests SHALL share one probe. Non-lock probe failures SHALL remain distinguishable from writer contention. PostgreSQL and in-memory SQLite SHALL remain unaffected.
+
+#### Scenario: Reads succeed while the writer remains unavailable
+
+- **GIVEN** repeated write failures beyond the busy timeout and successful SELECT queries
+- **WHEN** a fresh bounded BEGIN IMMEDIATE also fails
+- **THEN** readiness returns 503 and a diagnostic reports loss of write capability without asserting lock ownership
+
+#### Scenario: Transient contention or subsequent recovery
+
+- **GIVEN** brief contention or a writer that has subsequently released its transaction
+- **WHEN** the sustained-failure threshold has not been reached or a later probe acquires the writer slot
+- **THEN** contention alone does not fail readiness, and successful probe acquisition clears previous writer degradation
+
+### Requirement: File-backed SQLite engines retain bounded pools
+File-backed SQLite main and background engines MUST retain bounded pools of four connections with zero overflow and a finite checkout timeout. Session closure MUST return a connection without physically closing the final SQLite connection on every transaction. Existing WAL, synchronous and busy-timeout tuning MUST remain enabled. In-memory SQLite MUST preserve shared-engine behavior and PostgreSQL pooling MUST remain unchanged.
+
+#### Scenario: Ordinary session teardown retains connections
+- **WHEN** a file-SQLite session commits and closes
+- **THEN** its connection is returned to the bounded pool
+- **AND** ordinary close does not cause a last-connection checkpoint
+
+### Requirement: SQLite driver operation ownership survives cancellation
+File-SQLite application sessions MUST own running driver operations until their result is consumed and transaction cleanup completes. Caller cancellation MUST NOT interrupt driver execution, RETURNING result collection, commit or rollback. Concurrent use of one session MUST be rejected. Shutdown MUST drain owned operations before disposal, and MUST report unclean rather than reclaim a connection still in use.
+
+#### Scenario: Cancellation during a blocked writer
+- **WHEN** a caller is cancelled while SQLite is executing a write
+- **AND** the driver subsequently completes
+- **THEN** the operation result and cleanup complete before cancellation propagates
+- **AND** an independent writer recovers without garbage collection or restart
+
+### Requirement: SQLite writes share transaction admission
+All file-SQLite writes through configured main and background engines MUST share admission keyed by resolved database path. Admission MUST precede the first write and remain held until connection checkin after transaction cleanup. Within an explicit writer section, admission MUST precede the first database statement, including mutation predicate reads. Admission wait MUST be finite. Legacy writer section scopes MUST NOT introduce a second lock order.
+
+#### Scenario: Coordination and request writes contend
+- **WHEN** a background renewal owns an unfinished write transaction
+- **THEN** another local writer waits within the admission bound
+- **AND** read-only operations remain concurrent
+
+### Requirement: Late renewal cannot resurrect local leadership
+Renewal observers MUST share one in-flight driver operation. Cancelling or timing out an observer MUST NOT cancel that owner. A renewal completed after local demotion MUST NOT publish leadership or a new local deadline.
+
+#### Scenario: Demotion while renewal is blocked
+- **WHEN** leadership is demoted while a renewal remains in flight
+- **AND** the database later returns a successful renewal result
+- **THEN** the instance remains locally demoted

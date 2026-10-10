@@ -520,7 +520,13 @@ def responses_input_suffix_retains_prior_output(
             return False
         item_type = item_type_value if isinstance(item_type_value, str) else None
         if fresh_developer_preface_seen:
-            # This instruction starts exactly one new user turn.
+            # Model switches can supply a block of plaintext harness
+            # instructions. Retain each instruction; the block still needs
+            # a user input after the completed assistant turn.
+            if not fresh_followup_seen and _fresh_developer_message_is_transparent(
+                item, allow_response_owned_id=True, allow_missing_metadata=True
+            ):
+                continue
             if fresh_followup_seen or item_type not in (None, "message") or item.get("role") != "user":
                 return False
             if not _is_fresh_followup_input(item):

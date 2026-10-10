@@ -115,6 +115,7 @@ class DurableBridgeSessionCoordinator:
         turn_state: str | None,
         session_header: str | None,
         previous_response_id: str | None,
+        logical_thread_key: str | None = None,
     ) -> DurableBridgeLookup | None:
         api_key_scope = durable_bridge_api_key_scope(api_key_id)
         async with self._session() as session:
@@ -198,6 +199,17 @@ class DurableBridgeSessionCoordinator:
                 )
             if resolved_aliases:
                 return _to_lookup(resolved_aliases[0][1])
+            # A completed model-isolated fork is the current generation of
+            # this logical thread. This hint never overrides an explicit
+            # response/turn alias; those were resolved above.
+            if logical_thread_key is not None:
+                snapshot = await repository.resolve_alias(
+                    alias_kind="logical_thread",
+                    alias_value=logical_thread_key,
+                    api_key_scope=api_key_scope,
+                )
+                if snapshot is not None and not durable_bridge_snapshot_is_detached(snapshot):
+                    return _to_lookup(snapshot)
             snapshot = await repository.get_session(
                 session_key_kind=session_key_kind,
                 session_key_value=session_key_value,
@@ -223,6 +235,21 @@ class DurableBridgeSessionCoordinator:
             if snapshot is None:
                 return None
             return _to_lookup(snapshot)
+
+    async def lookup_completed_history_candidates(
+        self,
+        *,
+        api_key_id: str | None,
+        input_item_count: int,
+        prefix_fingerprints: Sequence[str],
+    ) -> list[DurableBridgeLookup]:
+        async with self._session() as session:
+            snapshots = await DurableBridgeRepository(session).list_completed_history_candidates(
+                api_key_scope=durable_bridge_api_key_scope(api_key_id),
+                input_item_count=input_item_count,
+                prefix_fingerprints=prefix_fingerprints,
+            )
+            return [_to_lookup(snapshot) for snapshot in snapshots if not durable_bridge_snapshot_is_detached(snapshot)]
 
     async def lookup_turn_state_target(
         self,
@@ -1135,6 +1162,7 @@ class DurableBridgeSessionCoordinator:
         input_item_count: int | None = None,
         input_full_fingerprint: str | None = None,
         pending_tool_calls: Mapping[str, str] | None = None,
+        logical_thread_key: str | None = None,
     ) -> DurableBridgeAliasRegistration:
         api_key_scope = durable_bridge_api_key_scope(api_key_id)
         async with self._session() as session:
@@ -1150,6 +1178,7 @@ class DurableBridgeSessionCoordinator:
                 latest_input_item_count=input_item_count,
                 latest_input_full_fingerprint=input_full_fingerprint,
                 latest_pending_tool_calls=pending_tool_calls,
+                logical_thread_key=logical_thread_key,
             )
 
     async def register_session_header(

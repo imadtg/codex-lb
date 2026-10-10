@@ -327,3 +327,17 @@ advance the stream from different tasks.
 ## Detached retirement sweep deadline
 
 Issue #2149 bounds aggregate detached-session lock waiting during request finalization. A sweep shares five seconds: if its first attempt consumes three seconds, the next receives two, and later attempts stop at expiry. Deferred generations remain tracked for later requests and their lifecycle owners. The deadline does not cancel resource-close owners or replace their existing close timeout.
+
+## Projected model-transition recovery
+
+A model switch can append several harness developer messages after a completed answer. Each portable instruction stays in the projection. A turn token without previous_response_id still needs an operation fence before dispatch, so explicit pre-created quota rejection reaches the verified replacement path before a transport retry consumes the allowance.
+
+Successful completion publishes a process/thread and API-key scoped logical-generation hint atomically with its response alias and history proof. For example, after compacted history completes on a model fork, a later full-history request without its turn token resolves that completed fork rather than the predecessor's longer history. Explicit continuity aliases retain their original meaning. Ordinary model forks can yield aliases after verified projection; live server-namespaced recovery forks remain protected against competing replacements.
+
+The existing alias table needs no schema migration. Hints begin populating on completed turns and remain optional. When an unanchored full-history request cannot prove the selected branch, the bridge can discover a unique matching completed ordinary model-fork proof in the caller's API-key scope, including CLOSED rows written by the unmodified base. It validates retained output, pending-tool settlement, and the complete projection. The matching content authorizes fresh execution; it does not identify an upstream account, response, token, or client alias. Deleted proofs and multiple qualifying proofs remain guarded. The hint follows completion publication order when generations overlap, while exact aliases and history validation still apply.
+
+Discovery hashes each proper input prefix in linear time, including forwarding-normalized tool namespaces, then queries matching fingerprints in parameter batches. More than 256 unrelated branches cannot hide a qualifying proof. File-pinned requests and explicit response/turn anchors retain their existing ownership handling.
+
+Fresh legacy recovery has a durable operation fence scoped to the API key and stable client process/thread identity. Its fingerprint covers canonical projected request content and any explicit prompt-cache key; derived cache keys are omitted because the process-local anchor index remints them after restart. The fence survives request re-preparation and random recovery lanes. An interrupted accepted request replays a complete recorded failure or returns the existing unresolved-operation error without another dispatch. Discovery does not use a latest-completed operation from another session to invent an owner.
+
+The process regression creates a compacted model fork on the unmodified deployed base, resumes it on the patch without a generation hint or turn token against the same database, then returns to the base using the ordinary returned token. This verifies state and wire compatibility without conversion. The tested base is f9c2cb51, not an independently verified official upstream tip; the upstream in these tests is synthetic.

@@ -24,5 +24,8 @@
   {"id":"quota_bridge_turn_state_changed_prefix","sources":["L2"],"kind":"proof_boundary","expectation":"A mismatched history does not reuse proof of the old prefix."},
   {"id":"quota_bridge_turn_state_missing_output","sources":["D1"],"kind":"adversarial_control","expectation":"A missing result cannot be hidden by later user input."},
   {"id":"quota_bridge_turn_state_agent_message_encrypted","sources":["L2"],"kind":"validated_provider_contract","expectation":"The exact Codex plaintext-envelope plus encrypted-content agent history can hand off between Codex accounts."},
-  {"id":"quota_bridge_turn_state_accepted_failure","sources":["U2"],"kind":"safety_control","expectation":"Created response does not enter the pre-created quota handoff path."}
+  {"id":"quota_bridge_turn_state_accepted_failure","sources":["U2"],"kind":"safety_control","expectation":"Created response does not enter the pre-created quota handoff path."},
+  {"id":"model_switch_developer_block","sources":["Oct3 request71"],"kind":"incident_reduction","expectation":"Completed final answer and consecutive model/harness developer instructions project onto another account and support follow-up."},
+  {"id":"quota_bridge_model_compaction_turn_state","sources":["Oct3 request94"],"kind":"incident_reduction","expectation":"Compacted model-isolated history with a turn token and no response id has a durable operation fence for quota handoff."},
+  {"id":"model_compaction_retry","sources":["Oct3 request95"],"kind":"incident_reduction","expectation":"A retry without turn token resolves the completed compacted model generation after its transport closes."}
 ]

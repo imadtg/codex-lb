@@ -10959,3 +10959,109 @@ When an ordinary HTTP response attempt is rejected for quota or a permanent acco
 - **GIVEN** a full input contains a tool call without its matching output
 - **WHEN** the first account explicitly rejects before response creation
 - **THEN** no alternate account receives that incomplete history
+
+### Requirement: Projected model-transition recovery
+The HTTP bridge SHALL accept validated consecutive plaintext developer instructions following a settled final answer and preceding the next user input as portable context. It SHALL retain the instructions in the projected request rather than requiring the original response owner solely because of their placement.
+
+#### Scenario: Model switch adds multiple harness instructions
+- **GIVEN** complete history contains the previous completed final answer followed by multiple plaintext developer messages and a new user message
+- **WHEN** the original owner becomes unavailable
+- **THEN** a compatible alternate receives the projected history and the following client request remains recoverable
+
+### Requirement: Turn-state continuations have a durable execution fence
+The HTTP bridge SHALL register a durable operation before dispatching a turn-state anchored continuation even when previous_response_id is absent. An explicit quota rejection before response creation SHALL use the verified portable projection for one fenced replacement.
+
+#### Scenario: Turn token without previous response id
+- **GIVEN** a client sends complete portable history with its established turn token and no previous_response_id
+- **WHEN** the owner rejects quota before producing any response events
+- **THEN** one alternate receives projected context without the old upstream turn token
+
+#### Scenario: Recovery from an ordinary model fork
+- **GIVEN** complete portable history and a fenced pre-created quota rejection on an ordinary internal model-change fork
+- **WHEN** recovery publishes the client turn-token alias on the alternate lane
+- **THEN** the ordinary fork's alias can transfer
+- **AND** a competing live server-namespaced recovery lane remains protected
+
+### Requirement: Model-isolated continuations preserve their current generation
+The HTTP bridge SHALL publish the current logical generation atomically with successful owner-fenced completion and resolve subsequent full-history requests to that completed model-isolated conversation generation rather than an older incompatible history solely because the transport fork closed or the client omitted its turn token. This hint SHALL be scoped to the logical process/thread identity and API key, and SHALL NOT override explicit continuity aliases. Legacy rows without a published hint SHALL retain existing exact alias semantics and SHALL support validated portable history recovery without requiring the hint.
+
+#### Scenario: Compaction then model change then retry
+- **GIVEN** compacted history completes on an isolated model-transition session
+- **WHEN** that session closes and the client retries its current full history without a turn token
+- **THEN** recovery uses the matching generation's history proof and does not compare it against the predecessor's longer input
+
+#### Scenario: Explicit older anchors remain authoritative
+- **GIVEN** a newer completed model fork has published its logical generation
+- **WHEN** the client explicitly references the predecessor's response or turn token
+- **THEN** the explicit alias retains its original session meaning
+
+#### Scenario: Rejected completion leaves generation unchanged
+- **GIVEN** a completed logical generation is registered
+- **WHEN** another completion is rejected by an ownership fence or protected response alias
+- **THEN** the existing logical generation and rejected session's completion proof remain unchanged
+
+### Requirement: Portable history recovery does not require generation hints
+For an unanchored full-history request whose selected branch cannot prove the supplied context, the HTTP bridge SHALL support a unique matching completed history proof stored by the unmodified base in the caller's API-key scope without requiring a logical-generation hint. It SHALL validate prefix identity and retained output/tool settlement before authorizing projected fresh execution. A content match SHALL NOT authorize reuse of the matched row's account-owned upstream response, turn token, or client aliases. Explicit client continuity anchors SHALL retain their existing ownership semantics.
+
+#### Scenario: Unmodified producer and patched continuation
+- **GIVEN** compacted context completed on an isolated model branch using the unmodified base and the service is replaced against the same persistent database
+- **WHEN** the patched service receives the matching full history without a turn token or response id
+- **THEN** it projects the complete supplied context without requiring new branch metadata
+- **AND** it preserves durable execution protection before dispatch
+
+#### Scenario: Return to the unmodified base
+- **GIVEN** the patched service completed that recovery and returned its ordinary continuity token
+- **WHEN** the service is replaced by the unmodified base and the client sends its standard token with the next history
+- **THEN** the unmodified base continues the conversation without state conversion
+
+#### Scenario: Explicit ownership and invalid context
+- **GIVEN** an explicit continuity anchor or a mismatched prefix, missing tool result, or account-bound file
+- **WHEN** the request is evaluated for history-proof discovery
+- **THEN** content similarity does not bypass ownership or retained-context validation
+
+#### Scenario: Ambiguous proof identity
+- **GIVEN** multiple completed rows qualify for the same history proof in the caller's scope
+- **WHEN** no exact continuity anchor disambiguates them
+- **THEN** the service does not arbitrarily select an upstream owner or discard an execution fence
+
+#### Scenario: Unrelated retained branches
+- **GIVEN** more than 256 unrelated completed branches exist in the caller's scope
+- **WHEN** exactly one completed proof qualifies for the supplied history
+- **THEN** unrelated rows do not prevent discovering that proof
+
+#### Scenario: Interrupted recovery survives restart
+- **GIVEN** projected recovery emitted partial output and disconnected before completion
+- **WHEN** the process restarts and receives identical history with a newly derived prompt-cache key
+- **THEN** its durable operation fence replays the recorded failure or refuses unresolved execution without another dispatch
+- **AND** explicit cache keys, different client scopes, different API-key scopes, and changed request content retain distinct execution identities
+
+### Requirement: Terminal-append bound leaves the durable append running
+
+When the terminal transcript persistence bound expires, or the caller waiting on it is cancelled, the event spooler MUST stop waiting and MUST NOT cancel the terminal append task. The task MUST remain owned by the spooler until it commits or fails. When the bound expires, the caller MUST receive the not-persisted, settlement-required result within the bound. When the caller is cancelled, the cancellation MUST propagate to the caller. A late commit of that append MUST NOT make the transcript replayable or rewrite a settled outcome.
+
+#### Scenario: Bound expires while the append holds the SQLite writer
+
+- **GIVEN** a terminal append holds a write transaction and is awaiting a statement
+- **WHEN** the persistence bound expires
+- **THEN** the caller receives a not-persisted, settlement-required result
+- **AND** the append is not cancelled and runs to completion
+- **AND** another connection can then take the SQLite writer slot
+
+#### Scenario: Caller cancelled while the append holds the SQLite writer
+
+- **GIVEN** a terminal append holds a write transaction and is awaiting a statement
+- **WHEN** the caller waiting on the bound is cancelled
+- **THEN** the cancellation propagates to the caller
+- **AND** the append is not cancelled and runs to completion
+- **AND** another connection can then take the SQLite writer slot
+
+### Requirement: Recovery ports retain the fork's projectable context
+
+Verified full-resend recovery SHALL retain projectable reasoning, compaction, search records, tool call/output pairs and native agent-message content in order. It MAY unlink source item IDs. Agent input SHALL NOT replace missing prior output or incomplete pending-tool settlement. Recovery SHALL preserve operation admission, visible-output and unknown-execution fences. Resource-bound bodies SHALL remain on their required account. Equivalent HTTP bridge and direct WebSocket recovery SHALL respect the same context retention and settlement-before-health invariants.
+
+#### Scenario: Full resend switches accounts without context loss
+
+- **GIVEN** a verified full resend containing retained ciphertext and a complete local tool history
+- **WHEN** the original account reports usage exhaustion before visible output
+- **THEN** an eligible alternate receives the complete projectable history without source-owned anchors
+- **AND** account health writes occur only after usage reservation settlement

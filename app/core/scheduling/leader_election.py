@@ -10,6 +10,7 @@ from sqlalchemy import Float, Result, bindparam, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config.settings import get_settings
+from app.core.utils.shared_future import wait_on_shared_future
 from app.db.models import SchedulerLeader
 from app.db.session import get_background_session
 from app.db.sqlite_lock_retry import is_sqlite_lock_error, sqlite_error_name
@@ -196,6 +197,8 @@ class LeaderElection:
     def __init__(self, leader_id: str | None = None) -> None:
         self._leader_id = leader_id or str(uuid.uuid4())
         self._is_leader = False
+        self._lease_generation = 0
+        self._renewal_owner: asyncio.Task[bool] | None = None
         # Monotonic (event-loop clock) estimate of when the lease we hold
         # expires, set on every successful acquire/renew and cleared on
         # authoritative loss. ``None`` means no lease is currently held. It is
@@ -241,6 +244,7 @@ class LeaderElection:
 
         ttl = settings.leader_election_ttl_seconds
         loop = asyncio.get_running_loop()
+        generation = self._lease_generation
         try:
             async with get_background_session() as session:
                 acquire_sql = _SQLITE_ACQUIRE_SQL if _dialect_name(session) == "sqlite" else _POSTGRES_ACQUIRE_SQL
@@ -276,8 +280,7 @@ class LeaderElection:
                     # (functionally no-op) commit then succeeds. Only a genuine
                     # connection error observed BEFORE this authoritative row
                     # result may fall through to the preservation branch.
-                    self._is_leader = False
-                    self._lease_deadline = None
+                    self._demote()
                     try:
                         await session.commit()
                     except Exception:
@@ -310,18 +313,34 @@ class LeaderElection:
                 )
                 return True
             logger.warning("Leader election failed, defaulting to non-leader", exc_info=True)
-            self._is_leader = False
-            self._lease_deadline = None
+            self._demote()
             return False
 
         # A no-row (authoritative non-owner) result already returned False above,
         # so ``remaining`` is the DB-RETURNED remaining lease of a row this
         # statement wrote. Anchor the local deadline to it and promote.
+        if generation != self._lease_generation:
+            return False
         self._is_leader = True
         self._lease_deadline = acquired_at + remaining
         return True
 
+    def _demote(self) -> None:
+        self._is_leader = False
+        self._lease_deadline = None
+        self._lease_generation += 1
+
     async def renew(self) -> bool:
+        if not self._is_leader:
+            return False
+        owner = self._renewal_owner
+        if owner is None or owner.done():
+            owner = asyncio.create_task(self._renew_owned(self._lease_generation), name="leader-renewal-owner")
+            self._renewal_owner = owner
+            owner.add_done_callback(self._on_renewal_done)
+        return await wait_on_shared_future(owner)
+
+    async def _renew_owned(self, generation: int) -> bool:
         """Extend the held lease; demote when the lease is no longer ours.
 
         Raises on database errors so callers can distinguish a lost lease
@@ -365,8 +384,8 @@ class LeaderElection:
                 # running as a believed-leader until another error or the local
                 # deadline; a definitive rowcount-0 loss must demote and cancel
                 # the body immediately.
-                self._is_leader = False
-                self._lease_deadline = None
+                if generation == self._lease_generation:
+                    self._demote()
                 try:
                     await session.commit()
                 except Exception:
@@ -385,6 +404,8 @@ class LeaderElection:
         # monotonic instant to the DB-returned remaining so the deadline tracks
         # the database's authoritative expiry — never backdated by a lock wait,
         # never outrunning the row.
+        if generation != self._lease_generation or not self._is_leader:
+            return False
         self._lease_deadline = renew_anchor + remaining
         return True
 
@@ -420,8 +441,7 @@ class LeaderElection:
         Failure to release must never block shutdown; the lease then simply
         expires after the TTL.
         """
-        self._is_leader = False
-        self._lease_deadline = None
+        self._demote()
         settings = get_settings()
         if not settings.leader_election_enabled:
             await self._stop_release_keeper()
@@ -660,8 +680,7 @@ class LeaderElection:
                         lease_deadline = self._lease_deadline
                     remaining = lease_deadline - loop.time()
                     if remaining <= 0:
-                        self._is_leader = False
-                        self._lease_deadline = None
+                        self._demote()
                         lease_lost = True
                         return
                     # Begin the renewal with enough budget to FINISH before the
@@ -742,8 +761,7 @@ class LeaderElection:
                             lease_deadline = self._lease_deadline
                             consecutive_errors = 0
                             continue
-                        self._is_leader = False
-                        self._lease_deadline = None
+                        self._demote()
                         renewed = False
                     else:
                         consecutive_errors = 0
@@ -783,8 +801,7 @@ class LeaderElection:
                     self._leader_id,
                     exc_info=heartbeat_task.exception(),
                 )
-                self._is_leader = False
-                self._lease_deadline = None
+                self._demote()
                 lease_lost = True
             if lease_lost:
                 logger.warning(
@@ -852,15 +869,7 @@ class LeaderElection:
             logger.warning("Leader-gated task failed while being cancelled", exc_info=exc)
 
     def _abandon_renewal(self, task: asyncio.Task[bool]) -> None:
-        """Request cancellation of a stalled renewal without awaiting its unwind.
-
-        The heartbeat already observed the time-box elapse, so leadership can
-        be treated as at risk immediately. Cancellation cleanup of a hung
-        database call (a blocked rollback or driver call during session
-        teardown) may itself block, so the task is dropped here — tracked with
-        a strong reference and a done callback that consumes its result — and
-        left to unwind in the background rather than blocking the loop.
-        """
+        """Detach a timed-out observer; the shared driver owner keeps running."""
         self._abandoned_renewals.add(task)
         task.add_done_callback(self._on_renewal_done)
         task.cancel()
@@ -916,6 +925,14 @@ class LeaderElection:
         return True
 
     async def _renew_lease_row(self) -> bool:
+        owner = self._renewal_owner
+        if owner is None or owner.done():
+            owner = asyncio.create_task(self._renew_drain_owned(), name="leader-drain-renewal-owner")
+            self._renewal_owner = owner
+            owner.add_done_callback(self._on_renewal_done)
+        return await wait_on_shared_future(owner)
+
+    async def _renew_drain_owned(self) -> bool:
         """Extend the lease row's expiry keyed on our ``leader_id``.
 
         Unlike :meth:`renew` this consults neither the in-memory ``_is_leader``
