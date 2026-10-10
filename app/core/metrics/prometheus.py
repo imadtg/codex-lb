@@ -331,6 +331,39 @@ if PROMETHEUS_AVAILABLE:
         ["outcome"],
         registry=REGISTRY,
     )
+    http_bridge_spool_batch_flushes_total = Counter(
+        "codex_lb_http_bridge_spool_batch_flushes_total",
+        "HTTP bridge nonterminal batch append attempts (not all database transactions)",
+        ["format", "reason", "outcome"],
+        registry=REGISTRY,
+    )
+    http_bridge_spool_batch_events = Histogram(
+        "codex_lb_http_bridge_spool_batch_events",
+        "Events in successfully persisted HTTP bridge nonterminal batches",
+        ["format"],
+        buckets=(1, 2, 4, 8, 16, 32, 64, 128, 256),
+        registry=REGISTRY,
+    )
+    http_bridge_spool_batch_bytes = Histogram(
+        "codex_lb_http_bridge_spool_batch_bytes",
+        "Logical UTF-8 bytes in successfully persisted HTTP bridge nonterminal batches",
+        ["format"],
+        buckets=(256, 1024, 4096, 16384, 65536, 262144, 1048576, 2097152),
+        registry=REGISTRY,
+    )
+    http_bridge_spool_queue_age_seconds = Histogram(
+        "codex_lb_http_bridge_spool_queue_age_seconds",
+        "Oldest event queue age when an HTTP bridge batch append starts",
+        ["reason"],
+        buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 5, 30),
+        registry=REGISTRY,
+    )
+    http_bridge_spool_batch_duration_seconds = Histogram(
+        "codex_lb_http_bridge_spool_batch_duration_seconds",
+        "HTTP bridge nonterminal batch append duration",
+        ["outcome"],
+        registry=REGISTRY,
+    )
     http_bridge_spool_cleanup_runs_total = Counter(
         "codex_lb_http_bridge_spool_cleanup_runs_total",
         "Total durable HTTP bridge transcript cleanup passes by outcome",
@@ -536,6 +569,11 @@ else:
     http_bridge_prewarm_total: CounterLike | None = None
     http_bridge_stuck_retire_total: CounterLike | None = None
     http_bridge_retry_circuit_total: CounterLike | None = None
+    http_bridge_spool_batch_flushes_total: CounterLike | None = None
+    http_bridge_spool_batch_events: HistogramLike | None = None
+    http_bridge_spool_batch_bytes: HistogramLike | None = None
+    http_bridge_spool_queue_age_seconds: HistogramLike | None = None
+    http_bridge_spool_batch_duration_seconds: HistogramLike | None = None
     http_bridge_spool_cleanup_runs_total: CounterLike | None = None
     http_bridge_spool_cleanup_deleted_operations_total: CounterLike | None = None
     http_bridge_spool_cleanup_duration_seconds: HistogramLike | None = None
@@ -604,6 +642,11 @@ __all__ = [
     "continuity_replay_rejected_total",
     "http_bridge_prewarm_total",
     "http_bridge_retry_circuit_total",
+    "http_bridge_spool_batch_flushes_total",
+    "http_bridge_spool_batch_events",
+    "http_bridge_spool_batch_bytes",
+    "http_bridge_spool_queue_age_seconds",
+    "http_bridge_spool_batch_duration_seconds",
     "http_bridge_spool_cleanup_backlog_likely",
     "http_bridge_spool_cleanup_deleted_operations_total",
     "http_bridge_spool_cleanup_duration_seconds",

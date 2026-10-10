@@ -692,6 +692,7 @@ async def test_late_background_failure_after_terminal_timeout_does_not_leak_drop
     batcher = HttpBridgeOperationEventBatcher(
         durable,
         max_bytes=1024,
+        batch_size=1,
         flush_interval_seconds=60.0,
         terminal_append_timeout_seconds=0.01,
     )

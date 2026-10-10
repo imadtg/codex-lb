@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import builtins
 import importlib
 import re
 import sys
@@ -69,7 +68,9 @@ class _Counter(_MetricBase):
 
 
 class _Histogram(_MetricBase):
-    pass
+    def __init__(self, *args, buckets=None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.buckets = buckets
 
 
 class _Gauge(_MetricBase):
@@ -113,15 +114,9 @@ def _load_metrics_modules(
     if prometheus_client_module is not None:
         monkeypatch.setitem(sys.modules, "prometheus_client", prometheus_client_module)
     else:
-        monkeypatch.delitem(sys.modules, "prometheus_client", raising=False)
-        real_import = builtins.__import__
-
-        def _missing_prometheus_import(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "prometheus_client":
-                raise ImportError("prometheus_client is not installed")
-            return real_import(name, globals, locals, fromlist, level)
-
-        monkeypatch.setattr(builtins, "__import__", _missing_prometheus_import)
+        # import_module bypasses builtins.__import__; this blocks the optional
+        # package even when the test environment has the metrics extra installed.
+        monkeypatch.setitem(sys.modules, "prometheus_client", None)
 
     prometheus_module = importlib.import_module("app.core.metrics.prometheus")
     middleware_module = importlib.import_module("app.core.metrics.middleware")
@@ -146,6 +141,11 @@ def test_prometheus_metrics_defined_when_dependency_available(monkeypatch: pytes
     assert prometheus_module.continuity_replay_rejected_total.labelnames == ("surface", "reason")
     assert prometheus_module.upstream_reasoning_replay_400_total.name == "codex_lb_upstream_reasoning_replay_400_total"
     assert prometheus_module.upstream_reasoning_replay_400_total.labelnames == ()
+    assert prometheus_module.http_bridge_spool_batch_flushes_total.labelnames == ("format", "reason", "outcome")
+    assert prometheus_module.http_bridge_spool_batch_events.labelnames == ("format",)
+    assert prometheus_module.http_bridge_spool_batch_bytes.labelnames == ("format",)
+    assert prometheus_module.http_bridge_spool_queue_age_seconds.labelnames == ("reason",)
+    assert prometheus_module.http_bridge_spool_batch_duration_seconds.labelnames == ("outcome",)
     assert prometheus_module.account_inflight_leases.name == "codex_lb_account_inflight_leases"
     assert prometheus_module.account_inflight_leases.labelnames == ("account_id", "kind")
     assert prometheus_module.image_requests_total.name == "codex_lb_image_requests_total"

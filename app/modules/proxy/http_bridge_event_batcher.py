@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.config.settings import get_settings
+from app.core.metrics import prometheus as metrics
 from app.db.models import HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2, HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
 from app.modules.proxy.durable_bridge_repository import DurableBridgeOperationEventInput
 
@@ -21,6 +23,7 @@ class _PendingOperationEvent:
     instance_id: str
     owner_epoch: int
     event_text: str
+    enqueued_at: float = field(default_factory=lambda: time.monotonic())
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,22 +170,56 @@ class HttpBridgeOperationEventBatcher:
 
     async def _run(self) -> None:
         while True:
+            # Clear before inspecting queues: arrivals during inspection or
+            # writes must still wake the next wait. A wake only recomputes due
+            # work; it does not turn a partial batch into an immediate write.
+            self._wake.clear()
+            operation_ids, delay = await self._operation_ids_to_flush()
+            if operation_ids:
+                for operation_id in operation_ids:
+                    await self._flush_one(operation_id, background=True)
+                await asyncio.sleep(0)
+                continue
             try:
-                await asyncio.wait_for(self._wake.wait(), timeout=self._flush_interval_seconds)
+                if delay is None:
+                    await self._wake.wait()
+                else:
+                    await asyncio.wait_for(self._wake.wait(), timeout=delay)
             except TimeoutError:
                 pass
-            self._wake.clear()
-            operation_ids = await self._operation_ids_to_flush()
-            for operation_id in operation_ids:
-                await self._flush_one(operation_id)
 
-    async def _operation_ids_to_flush(self) -> list[str]:
+    async def _operation_ids_to_flush(self) -> tuple[list[str], float | None]:
         async with self._lock:
-            return [operation_id for operation_id in self._pending if operation_id not in self._closing_operations]
+            now = time.monotonic()
+            ready: list[str] = []
+            delay: float | None = None
+            for operation_id, pending in self._pending.items():
+                if operation_id in self._closing_operations or not pending:
+                    continue
+                remaining = pending[0].enqueued_at + self._flush_interval_seconds - now
+                if len(pending) >= self._batch_size or remaining <= 0:
+                    ready.append(operation_id)
+                else:
+                    delay = remaining if delay is None else min(delay, remaining)
+            return ready, delay
 
-    async def _take_batch(self, operation_id: str) -> list[_PendingOperationEvent]:
+    async def _take_batch(
+        self, operation_id: str, *, background: bool = False
+    ) -> tuple[list[_PendingOperationEvent], str]:
         async with self._lock:
             pending = self._pending.get(operation_id, [])
+            reason = "drain"
+            if background:
+                # The snapshot can become stale while another operation writes
+                # or a terminal drain empties and replaces this queue.
+                if operation_id in self._closing_operations or not pending:
+                    return [], reason
+                if len(pending) >= self._batch_size:
+                    reason = "size"
+                elif time.monotonic() >= pending[0].enqueued_at + self._flush_interval_seconds:
+                    reason = "deadline"
+                else:
+                    return [], reason
             batch = pending[: self._batch_size]
             if batch:
                 del pending[: len(batch)]
@@ -190,16 +227,19 @@ class HttpBridgeOperationEventBatcher:
                 self._pending_bytes -= sum(len(item.event_text.encode("utf-8")) for item in batch)
             if not pending:
                 self._pending.pop(operation_id, None)
-            return batch
+            return batch, reason
 
-    async def _flush_one(self, operation_id: str) -> None:
+    async def _flush_one(self, operation_id: str, *, background: bool = False) -> None:
         async with self._flush_lock:
-            batch = await self._take_batch(operation_id)
+            batch, reason = await self._take_batch(operation_id, background=background)
             if not batch:
                 return
-            async with self._lock:
-                if operation_id in self._dropped_operations:
-                    return
+            started = time.monotonic()
+            outcome = "cancelled"
+            if metrics.http_bridge_spool_queue_age_seconds is not None:
+                metrics.http_bridge_spool_queue_age_seconds.labels(reason=reason).observe(
+                    max(0.0, started - batch[0].enqueued_at)
+                )
             try:
                 events = [
                     DurableBridgeOperationEventInput(
@@ -221,25 +261,47 @@ class HttpBridgeOperationEventBatcher:
                         events=events,
                         max_bytes=self._max_bytes,
                     )
+                outcome = "persisted" if persisted else "rejected"
+                if persisted:
+                    if metrics.http_bridge_spool_batch_events is not None:
+                        metrics.http_bridge_spool_batch_events.labels(format=self._spool_format).observe(len(batch))
+                    if metrics.http_bridge_spool_batch_bytes is not None:
+                        metrics.http_bridge_spool_batch_bytes.labels(format=self._spool_format).observe(
+                            sum(len(item.event_text.encode("utf-8")) for item in batch)
+                        )
                 if not persisted:
-                    async with self._lock:
-                        if operation_id in self._contexts:
-                            self._dropped_operations.add(operation_id)
-                        dropped = self._pending.pop(operation_id, [])
-                        self._pending_count -= len(dropped)
-                        self._pending_bytes -= sum(len(item.event_text.encode("utf-8")) for item in dropped)
+                    await self._drop_pending_operation(operation_id)
+            except asyncio.CancelledError:
+                # Once extracted, a cancelled append has an ambiguous durable
+                # outcome. Never finalize a later terminal as a complete spool
+                # with that batch missing, even if native commit finishes late.
+                await self._drop_pending_operation(operation_id)
+                raise
             except Exception:
-                async with self._lock:
-                    if operation_id in self._contexts:
-                        self._dropped_operations.add(operation_id)
-                    dropped = self._pending.pop(operation_id, [])
-                    self._pending_count -= len(dropped)
-                    self._pending_bytes -= sum(len(item.event_text.encode("utf-8")) for item in dropped)
+                outcome = "error"
+                await self._drop_pending_operation(operation_id)
                 logger.debug(
                     "Dropping failed HTTP bridge transcript event batch operation_id=%s",
                     operation_id,
                     exc_info=True,
                 )
+            finally:
+                if metrics.http_bridge_spool_batch_flushes_total is not None:
+                    metrics.http_bridge_spool_batch_flushes_total.labels(
+                        format=self._spool_format, reason=reason, outcome=outcome
+                    ).inc()
+                if metrics.http_bridge_spool_batch_duration_seconds is not None:
+                    metrics.http_bridge_spool_batch_duration_seconds.labels(outcome=outcome).observe(
+                        time.monotonic() - started
+                    )
+
+    async def _drop_pending_operation(self, operation_id: str) -> None:
+        async with self._lock:
+            if operation_id in self._contexts:
+                self._dropped_operations.add(operation_id)
+            dropped = self._pending.pop(operation_id, [])
+            self._pending_count -= len(dropped)
+            self._pending_bytes -= sum(len(item.event_text.encode("utf-8")) for item in dropped)
 
     async def flush_operation(self, *, operation_id: str) -> None:
         await self.flush_pending_operation(operation_id=operation_id)
